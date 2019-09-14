@@ -12,18 +12,19 @@ pub fn stdout_output(data: &send_data_t) {
     let formatter = |data: &send_data_t| -> String {
         fixed_length_string(&data.buffer, data.msg_size as usize)
     };
+
+    let truncated_str = if data.truncated != 0 {
+        " (truncated)".to_string().red()
+    } else {
+        "".to_string().blue()
+    };
+
     println!(
-        "{} {} {} {} {} {}",
-        format!("[{} -> {}]", data.pid, data.peer_pid).yellow(),
+        "{} {} {} {}",
+        format!("[{}\t-> {}]", data.pid, data.peer_pid).yellow(),
         socket_name(&data.sun_path, Some(data.path_size as usize)).green(),
-        format!("[{} bytes]", data.path_size).green(),
         formatter(&data),
-        format!("[{} bytes]", data.msg_size).blue(),
-        if data.truncated != 0 {
-            "[truncated]".to_string().red()
-        } else {
-            "".to_string().blue()
-        },
+        format!("[{} bytes{}]", data.msg_size, truncated_str).blue(),
     );
 }
 
@@ -78,8 +79,8 @@ fn fixed_length_string(x: &[u8], size: usize) -> String {
     x[0..size]
         .iter()
         .map(|b| {
-                let vec: Vec<u8> = std::ascii::escape_default(*b).collect();
-                String::from_utf8(vec).unwrap()
+            let vec: Vec<u8> = std::ascii::escape_default(*b).collect();
+            String::from_utf8(vec).unwrap()
         })
         .collect()
 }
