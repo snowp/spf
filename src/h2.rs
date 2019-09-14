@@ -55,16 +55,42 @@ impl Display for FrameType {
     }
 }
 
-trait PaddableFlag {
-    fn padded(flags: u8) -> bool;
+fn flagged(f: u8, flags: u8) -> bool {
+    f & flags != 0
 }
 
+#[derive(Copy, Clone)]
+struct FrameHeader {
+    // Not part of the HTTP/2 frame header: this indicates whether this was a HTTP/2 frame sent by the client.
+    client: bool,
+    // Size of the HTTP/2 frame payload.
+    len: usize,
+    frame_type: FrameType,
+    raw_flags: u8,
+    stream_id: u32,
+}
+
+// A RawFrame is the frame header with a payload. Typed frames parse the contents of the payload and add semantic
+// meaning to the bits set in header.raw_flags.
+struct RawFrame {
+    header: FrameHeader,
+    payload: Vec<u8>,
+}
+
+// Meaning of flags set on a DATA frame.
 #[derive(Debug)]
 enum DataFlag {
     EndStream = 0x1,
     Padded = 0x8,
 }
 
+// Header values specific to the DATA frame.
+struct DataHeader {
+    end_stream: bool,
+    padded: bool,
+}
+
+// Meaning of flags set on a HEADERS frame.
 #[derive(Debug)]
 enum HeadersFlag {
     EndStream = 0x1,
@@ -73,35 +99,7 @@ enum HeadersFlag {
     Priority = 0x20,
 }
 
-impl PaddableFlag for HeadersFlag {
-    fn padded(flags: u8) -> bool {
-        flagged(HeadersFlag::Padded as u8, flags)
-    }
-}
-
-fn flagged(f: u8, flags: u8) -> bool {
-    f & flags != 0
-}
-
-#[derive(Copy, Clone)]
-struct FrameHeader {
-    client: bool,
-    len: usize,
-    raw_flags: u8,
-    frame_type: FrameType,
-    stream_id: u32,
-}
-
-struct RawFrame {
-    header: FrameHeader,
-    payload: Vec<u8>,
-}
-
-struct DataHeader {
-    end_stream: bool,
-    padded: bool,
-}
-
+// Header values specific to a HEADERS frame.
 struct HeadersHeader {
     end_stream: bool,
     end_headers: bool,
@@ -109,6 +107,27 @@ struct HeadersHeader {
     priority: bool,
 }
 
+// Meaning of flags set on a CONTINUATION frame.
+enum ContinuationFlag {
+    EndHeaders = 0x4,
+}
+
+// Header values specific to a CONTINUATION frame.
+struct ContinuationHeader {
+    end_headers: bool,
+}
+
+// Meaning of flags set on a SETTINGS frame.
+enum SettingFlags {
+    Ack = 0x1,
+}
+
+// Header values specific to a SETTINGS frame.
+struct SettingsHeader {
+    ack: bool,
+}
+
+// Meaning of identifiers set in a SETTINGS payload.
 #[derive(Debug)]
 enum StreamSetting {
     TableSize = 0x1,
@@ -119,25 +138,7 @@ enum StreamSetting {
     MaxHeaderListSize = 0x6,
 }
 
-trait ParsableFrame<'a> {
-    fn try_parse(f: &'a RawFrame) -> Result<&dyn Display, Error>
-    where
-        Self: Sized;
-}
-
-struct Setting {
-    identifier: StreamSetting,
-    value: u32,
-}
-
-enum SettingFlags {
-    Ack = 0x1,
-}
-
-struct SettingsHeader {
-    ack: bool,
-}
-
+// Meaning of flags set on a PRIORITY frame.
 struct PriorityHeader {
     stream_dependency: u32,
     exclusive: bool,
@@ -147,11 +148,15 @@ struct PriorityHeader {
 enum TypedFrame {
     Data(FrameHeader, DataHeader, Vec<u8>),
     Headers(FrameHeader, HeadersHeader, Vec<(String, String)>),
-    SettingsFrame(FrameHeader, SettingsHeader, Vec<Setting>),
+    Continuation(FrameHeader, ContinuationHeader, Vec<(String, String)>),
+    SettingsFrame(FrameHeader, SettingsHeader, Vec<(StreamSetting, u32)>),
     PriorityFrame(FrameHeader, PriorityHeader),
     WindowUpdate(FrameHeader, u32),
 }
 
+// Reads the size of the padding from the provided payload and returns a vec
+// of the payload with the padding removed. Returns the original payload if
+// padded is false.
 fn remove_padding(payload: &[u8], padded: bool) -> Result<Vec<u8>, Error> {
     let (start, stop) = if padded {
         let mut c = Cursor::new(&payload);
@@ -164,7 +169,40 @@ fn remove_padding(payload: &[u8], padded: bool) -> Result<Vec<u8>, Error> {
     Ok(payload[start..stop].to_vec())
 }
 
+// Parses out the hpack encoded headers from a payload. This is used both by HEADERS and CONTINUATION frames.
+fn try_parse_header_block(payload: &[u8]) -> Result<Vec<(String, String)>, ParseError> {
+    let mut d = Decoder::new();
+    match d.decode(&payload) {
+        Ok(decoded) => {
+            let mut headers = Vec::new();
+            for (key, value) in decoded {
+                let key_str = String::from_utf8(key)
+                    .map_err(|_| ParseError::InvalidFrame("invalid header key".to_string()))?;
+                let value_str = String::from_utf8(value)
+                    .map_err(|_| ParseError::InvalidFrame("invalid header value".to_string()))?;
+
+                headers.push((key_str, value_str));
+            }
+            Ok(headers)
+        }
+        Err(_) => Err(ParseError::InvalidFrame(
+            "invalid hpack encoding".to_string(),
+        )),
+    }
+}
+
 impl TypedFrame {
+    // DATA payload format:
+    //  +---------------+
+    //  |Pad Length? (8)|
+    //  +---------------+-----------------------------------------------+
+    //  |                            Data (*)                         ...
+    //  +---------------------------------------------------------------+
+    //  |                           Padding (*)                       ...
+    //  +---------------------------------------------------------------+
+    //
+    // If the DataFlag::Padded flag is set, the first 8 bits will be the length
+    // of the padding.
     fn try_parse_data(f: &RawFrame) -> Result<Self, ParseError> {
         let padded = flagged(DataFlag::Padded as u8, f.header.raw_flags);
         let end_stream = flagged(DataFlag::EndStream as u8, f.header.raw_flags);
@@ -176,32 +214,29 @@ impl TypedFrame {
         ))
     }
 
+    // HEADERS payload format:
+    //  +---------------+
+    //  |Pad Length? (8)|
+    //  +-+-------------+-----------------------------------------------+
+    //  |E|                 Stream Dependency? (31)                     |
+    //  +-+-------------+-----------------------------------------------+
+    //  |  Weight? (8)  |
+    //  +-+-------------+-----------------------------------------------+
+    //  |                   Header Block Fragment (*)                 ...
+    //  +---------------------------------------------------------------+
+    //  |                           Padding (*)                       ...
+    //  +---------------------------------------------------------------+
+    //
+    // Stream Dependency and Weight are only present when the HeadersFlag::Priority flag is set.
+    // The code currently assumes that the priority flag will *not* be set. TODO fix this
+    // If the HeadersFlag::Padded flag is set, the first 8 bits will be the length
+    // of the padding.
     fn try_parse_headers(f: &RawFrame) -> Result<Self, ParseError> {
         let padded = flagged(HeadersFlag::Padded as u8, f.header.raw_flags);
         let end_stream = flagged(HeadersFlag::EndStream as u8, f.header.raw_flags);
         let end_headers = flagged(HeadersFlag::EndHeaders as u8, f.header.raw_flags);
         let priority = flagged(HeadersFlag::Priority as u8, f.header.raw_flags); // TODO handle this
         let payload = remove_padding(&f.payload, padded)?;
-
-        let mut d = Decoder::new();
-        let headers = match d.decode(&payload) {
-            Ok(decoded) => {
-                let mut headers = Vec::new();
-                for (key, value) in decoded {
-                    let key_str = String::from_utf8(key)
-                        .map_err(|_| Error::new(std::io::ErrorKind::Other, "invalid header key"))?;
-                    let value_str = String::from_utf8(value)
-                        .map_err(|_| Error::new(std::io::ErrorKind::Other, "invalid header key"))?;
-
-                    headers.push((key_str, value_str));
-                }
-                Ok(headers)
-            }
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "invalid hpack encoding",
-            )),
-        }?;
 
         Ok(TypedFrame::Headers(
             f.header,
@@ -211,10 +246,18 @@ impl TypedFrame {
                 end_headers,
                 priority,
             },
-            headers,
+            try_parse_header_block(&payload)?,
         ))
     }
 
+    // SETTINGS payload format:
+    //  +-------------------------------+
+    //  |       Identifier (16)         |
+    //  +-------------------------------+-------------------------------+
+    //  |                        Value (32)                             |
+    //  +---------------------------------------------------------------+
+    //
+    // The SETTINGS payload contains zero or more identifier-value pairs.
     fn try_parse_settings(f: &RawFrame) -> Result<Self, ParseError> {
         let mut settings = Vec::new();
         let mut cursor = Cursor::new(&f.payload);
@@ -237,7 +280,7 @@ impl TypedFrame {
             };
 
             let value = cursor.read_u32::<NetworkEndian>()?;
-            settings.push(Setting { value, identifier });
+            settings.push((identifier, value));
         }
 
         let ack = flagged(SettingFlags::Ack as u8, f.header.raw_flags);
@@ -248,6 +291,12 @@ impl TypedFrame {
         ))
     }
 
+    // PRIORITY payload format:
+    //  +-+-------------------------------------------------------------+
+    //  |E|                  Stream Dependency (31)                     |
+    //  +-+-------------+-----------------------------------------------+
+    //  |   Weight (8)  |
+    //  +-+-------------+
     fn try_parse_priority(f: &RawFrame) -> Result<Self, ParseError> {
         let mut cursor = Cursor::new(&f.payload);
         let dependency_with_flag = cursor.read_u32::<NetworkEndian>()?;
@@ -265,10 +314,24 @@ impl TypedFrame {
         ))
     }
 
+    // WINDOW_UPDATE payload format:
+    //  +-+-------------------------------------------------------------+
+    //  |R|              Window Size Increment (31)                     |
+    //  +-+-------------------------------------------------------------+
     fn try_parse_window_update(f: &RawFrame) -> Result<Self, ParseError> {
         let mut cursor = Cursor::new(&f.payload);
         let increment = cursor.read_u32::<NetworkEndian>()?;
         Ok(TypedFrame::WindowUpdate(f.header, (increment << 1) >> 1))
+    }
+
+    fn try_parse_continuation(f: &RawFrame) -> Result<Self, ParseError> {
+        let end_headers = flagged(ContinuationFlag::EndHeaders as u8, f.header.raw_flags);
+
+        Ok(TypedFrame::Continuation(
+            f.header,
+            ContinuationHeader { end_headers },
+            try_parse_header_block(&f.payload)?,
+        ))
     }
 
     fn try_parse(f: &RawFrame) -> Result<Self, ParseError> {
@@ -278,6 +341,7 @@ impl TypedFrame {
             FrameType::Settings => Self::try_parse_settings(f),
             FrameType::Priority => Self::try_parse_priority(f),
             FrameType::WindowUpdate => Self::try_parse_window_update(f),
+            FrameType::Continuation => Self::try_parse_continuation(f),
             _ => panic!(),
         }
     }
@@ -403,6 +467,26 @@ fn test_priority_header_display() {
     assert_eq!(format!("{}", f), " (10) (15) (true)");
 }
 
+impl Display for ContinuationHeader {
+    fn fmt(self: &Self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        if self.end_headers {
+            write!(f, " [end_headers=true]")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn test_continuation_header_display() {
+    {
+        let f = ContinuationHeader { end_headers: true };
+        assert_eq!(format!("{}", f), " [end_headers=true]");
+    }
+    let f = ContinuationHeader { end_headers: false };
+    assert_eq!(format!("{}", f), "");
+}
+
 impl Display for SettingsHeader {
     fn fmt(self: &Self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         if self.ack {
@@ -452,14 +536,22 @@ impl Display for TypedFrame {
             TypedFrame::SettingsFrame(header, settings_header, settings) => {
                 write!(f, "{}", header)?;
                 write!(f, "{}", settings_header)?;
-                for setting in settings {
-                    write!(f, "\n{:?}={}", setting.identifier, setting.value)?;
+                for (identifier, value) in settings {
+                    write!(f, "\n{:?}={}", identifier, value)?;
                 }
                 Ok(())
             }
             TypedFrame::WindowUpdate(header, window_header) => {
                 write!(f, "{}", header)?;
                 write!(f, " ({})", window_header)
+            }
+            TypedFrame::Continuation(header, continuation_header, headers) => {
+                write!(f, "{}", header)?;
+                write!(f, "{}", continuation_header)?;
+                for (key, value) in headers {
+                    write!(f, "\n{}: {}", key, value)?;
+                }
+                Ok(())
             }
         }
     }
@@ -499,14 +591,14 @@ fn test_typed_frame_display() {
             end_stream: true,
             end_headers: true,
         },
-        HashMap::from_iter(vec![
+        vec![
             ("a".to_string(), "b".to_string()),
             ("c".to_string(), "d".to_string()),
-        ]),
+        ],
     );
     assert_eq!(
         format!("{}", f),
-        ">> (1) HEADERS [end_headers=true,end_stream=true]\na: b\nc: d\n"
+        ">> (1) HEADERS [end_headers=true,end_stream=true]\na: b\nc: d"
     );
 
     let f = TypedFrame::PriorityFrame(
@@ -535,14 +627,8 @@ fn test_typed_frame_display() {
         },
         SettingsHeader { ack: true },
         vec![
-            Setting {
-                identifier: StreamSetting::EnablePush,
-                value: 0,
-            },
-            Setting {
-                identifier: StreamSetting::InitialWindowSize,
-                value: 100,
-            },
+            (StreamSetting::EnablePush, 0),
+            (StreamSetting::InitialWindowSize, 100),
         ],
     );
     assert_eq!(
@@ -569,8 +655,21 @@ impl From<Error> for ParseError {
     }
 }
 
+// TODO add tests for parsing raw HTTP/2 data
 impl RawFrame {
+    // HTTP/2 Frame layout:
+    //  +-----------------------------------------------+
+    //  |                 Length (24)                   |
+    //  +---------------+---------------+---------------+
+    //  |   Type (8)    |   Flags (8)   |
+    //  +-+-------------+---------------+-------------------------------+
+    //  |R|                 Stream Identifier (31)                      |
+    //  +=+=============================================================+
+    //  |                   Frame Payload (0...)                      ...
+    //  +---------------------------------------------------------------+
+    //
     fn try_parse(client: bool, d: &[u8], buf_len: usize) -> Result<(Self, usize), ParseError> {
+        // Too small to fit the frame, so cannot be valid.
         if buf_len < 9 {
             return Err(ParseError::TooSmall);
         }
@@ -582,6 +681,9 @@ impl RawFrame {
         let stream_id = (cursor.read_u32::<NetworkEndian>()? >> 1) << 1; // remove reserved bit
 
         if (len + 9) as usize > buf_len {
+            // We don't have the full payload, so give up.
+            // TODO we might want to output at least the raw frame header + a "truncated" string, as this likely
+            // means that the payload + header exceeds the size of the bpf buffer used.
             Err(ParseError::OutOfBounds)
         } else {
             Ok((
@@ -620,20 +722,22 @@ pub fn format(data: &bpf::send_data_t) {
             &data.buffer[itr..],
             data.msg_size as usize - itr,
         ) {
+            Ok((raw_frame, size)) => (raw_frame, size),
             Err(e) => {
                 // Invalid frame, skip output.
                 eprintln!("failed to parse frame {:?}", e);
                 return;
             }
-            Ok((raw_frame, size)) => (raw_frame, size),
         };
 
         itr += size;
 
-        if let Ok(typed_frame) = TypedFrame::try_parse(&raw_frame) {
-            println!("{}", typed_frame);
-        } else {
-            println!("{}", raw_frame);
+        match TypedFrame::try_parse(&raw_frame) {
+            Ok(typed_frame) => println!("{}", typed_frame),
+            Err(e) => {
+                eprintln!("failed to parse frame: {:?}", e);
+                println!("{}", raw_frame);
+            }
         }
     }
 }
