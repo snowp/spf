@@ -59,7 +59,7 @@ fn flagged(f: u8, flags: u8) -> bool {
     f & flags != 0
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct FrameHeader {
     // Not part of the HTTP/2 frame header: this indicates whether this was a HTTP/2 frame sent by the client.
     client: bool,
@@ -72,6 +72,7 @@ struct FrameHeader {
 
 // A RawFrame is the frame header with a payload. Typed frames parse the contents of the payload and add semantic
 // meaning to the bits set in header.raw_flags.
+#[derive(Debug)]
 struct RawFrame {
     header: FrameHeader,
     payload: Vec<u8>,
@@ -85,6 +86,7 @@ enum DataFlag {
 }
 
 // Header values specific to the DATA frame.
+#[derive(Debug)]
 struct DataHeader {
     end_stream: bool,
     padded: bool,
@@ -100,6 +102,7 @@ enum HeadersFlag {
 }
 
 // Header values specific to a HEADERS frame.
+#[derive(Debug)]
 struct HeadersHeader {
     end_stream: bool,
     end_headers: bool,
@@ -108,21 +111,25 @@ struct HeadersHeader {
 }
 
 // Meaning of flags set on a CONTINUATION frame.
+#[derive(Debug)]
 enum ContinuationFlag {
     EndHeaders = 0x4,
 }
 
 // Header values specific to a CONTINUATION frame.
+#[derive(Debug)]
 struct ContinuationHeader {
     end_headers: bool,
 }
 
 // Meaning of flags set on a SETTINGS frame.
+#[derive(Debug)]
 enum SettingFlags {
     Ack = 0x1,
 }
 
 // Header values specific to a SETTINGS frame.
+#[derive(Debug)]
 struct SettingsHeader {
     ack: bool,
 }
@@ -139,12 +146,14 @@ enum StreamSetting {
 }
 
 // Meaning of flags set on a PRIORITY frame.
+#[derive(Debug)]
 struct PriorityHeader {
     stream_dependency: u32,
     exclusive: bool,
     weight: u8,
 }
 
+#[derive(Debug)]
 enum TypedFrame {
     Data(FrameHeader, DataHeader, Vec<u8>),
     Headers(FrameHeader, HeadersHeader, Vec<(String, String)>),
@@ -157,10 +166,15 @@ enum TypedFrame {
 // Reads the size of the padding from the provided payload and returns a vec
 // of the payload with the padding removed. Returns the original payload if
 // padded is false.
-fn remove_padding(payload: &[u8], padded: bool) -> Result<Vec<u8>, Error> {
+fn remove_padding(payload: &[u8], padded: bool) -> Result<Vec<u8>, ParseError> {
     let (start, stop) = if padded {
         let mut c = Cursor::new(&payload);
-        let pad_len = c.read_u32::<NetworkEndian>()?;
+        let pad_len = c.read_u8()?;
+
+        // This shouldn't happen
+        if pad_len as usize > payload.len() {
+            return Err(ParseError::OutOfBounds);
+        }
         (4, payload.len() - pad_len as usize)
     } else {
         (0, payload.len())
@@ -703,41 +717,71 @@ impl RawFrame {
     }
 }
 
-pub fn format(data: &bpf::send_data_t) {
+#[test]
+fn test_corpus_parsing() {
+    let manifest_dir = std::env::vars()
+        .find(|(k, _)| k == "CARGO_MANIFEST_DIR")
+        .map(|(_, v)| v)
+        .unwrap();
+    for entry in std::fs::read_dir(manifest_dir + "/nghttp_corpus").unwrap() {
+        let path = entry.unwrap().path();
+        let input: Vec<u8> = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) => panic!(
+                "failed to read file {:?}: {} (pwd: {:?})",
+                path,
+                e,
+                std::env::current_dir().unwrap()
+            ),
+        };
+
+        for f in try_parse_frames(true, &input, input.len()).unwrap() {
+            // println!("{:?}", f);
+        }
+    }
+}
+
+fn try_parse_frames(client: bool, data: &[u8], len: usize) -> Result<Vec<TypedFrame>, ParseError> {
     // Skip the preamble: this is sent during connection setup for HTTP/2.
     let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-    let mut itr = if data.buffer[0..preface.len()] == *preface {
+    let mut itr = if data[0..preface.len()] == *preface {
         preface.len()
     } else {
         0
     };
 
+    let mut frames = Vec::new();
     // We assume that each data chunk contains zero or more HTTP/2 frames. We attempt
     // to parse it as a typed HTTP/2 frame and print it, falling back to printing information
     // about the raw frame.
-    while itr < data.msg_size as usize {
-        let (raw_frame, size) = match RawFrame::try_parse(
-            data.bound == 0,
-            &data.buffer[itr..],
-            data.msg_size as usize - itr,
-        ) {
+    while itr < len as usize {
+        let (raw_frame, size) = match RawFrame::try_parse(client, &data[itr..], len - itr) {
             Ok((raw_frame, size)) => (raw_frame, size),
-            Err(e) => {
-                // Invalid frame, skip output.
-                eprintln!("failed to parse frame {:?}", e);
-                return;
-            }
+            Err(e) => return Err(e),
         };
 
         itr += size;
 
         match TypedFrame::try_parse(&raw_frame) {
-            Ok(typed_frame) => println!("{}", typed_frame),
+            Ok(typed_frame) => frames.push(typed_frame),
             Err(e) => {
-                eprintln!("failed to parse frame: {:?}", e);
-                println!("{}", raw_frame);
+                eprintln!("failed to parse {:?} as typed frame", raw_frame);
+                return Err(e);
             }
         }
+    }
+
+    Ok(frames)
+}
+
+pub fn format(data: &bpf::send_data_t) {
+    match try_parse_frames(data.bound != 0, &data.buffer, data.msg_size as usize) {
+        Ok(frames) => {
+            for f in frames {
+                println!("{}", f);
+            }
+        }
+        Err(e) => eprintln!("failed to parse frames: {:?}", e),
     }
 }
