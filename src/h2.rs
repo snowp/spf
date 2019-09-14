@@ -166,14 +166,43 @@ struct PushPromiseHeaders {
 }
 
 #[derive(Debug)]
+enum ParsedHeaders {
+    Full(Vec<(String, String)>),
+    // We use this to denote that we did not have enough information to parse out full header values. HPACK encoding is
+    // stateful, so many header fragments will require knowledge of the previous fragments sent on the same stream to make
+    // sense. Until we do the work to track stream lifetimes (made complicated by the fact that multiple connections are
+    // observed at the same time) we'll improve the handling here. Alternatively, we can parse the HPACK data ourselves
+    // and output the partial updates instead of attempting to maintain state.
+    Incomplete,
+}
+
+impl Display for ParsedHeaders {
+    fn fmt(self: &Self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match self {
+            ParsedHeaders::Full(hs) => {
+                for (key, value) in hs {
+                    write!(f, "\n{}: {}", key, value)?;
+                }
+            }
+            ParsedHeaders::Incomplete => {
+                write!(f, "[incomplete]")?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 enum TypedFrame {
     Data(FrameHeader, DataHeader, Vec<u8>),
-    Headers(FrameHeader, HeadersHeader, Vec<(String, String)>),
-    Continuation(FrameHeader, ContinuationHeader, Vec<(String, String)>),
+    Headers(FrameHeader, HeadersHeader, ParsedHeaders),
+    Continuation(FrameHeader, ContinuationHeader, ParsedHeaders),
     SettingsFrame(FrameHeader, SettingsHeader, Vec<(StreamSetting, u32)>),
     PriorityFrame(FrameHeader, PriorityHeader),
     WindowUpdate(FrameHeader, u32),
-    PushPromise(FrameHeader, PushPromiseHeaders, u32, Vec<(String, String)>),
+    PushPromise(FrameHeader, PushPromiseHeaders, u32, ParsedHeaders),
+    GoAway(FrameHeader, u32, u32, String), // TODO use struct
 }
 
 // Reads the size of the padding from the provided payload and returns a vec
@@ -197,7 +226,7 @@ fn remove_padding(payload: &[u8], padded: bool) -> Result<Vec<u8>, ParseError> {
 }
 
 // Parses out the hpack encoded headers from a payload. This is used both by HEADERS and CONTINUATION frames.
-fn try_parse_header_block(payload: &[u8]) -> Result<Vec<(String, String)>, ParseError> {
+fn try_parse_header_block(payload: &[u8]) -> Result<ParsedHeaders, ParseError> {
     let mut d = Decoder::new();
     match d.decode(&payload) {
         Ok(decoded) => {
@@ -210,11 +239,11 @@ fn try_parse_header_block(payload: &[u8]) -> Result<Vec<(String, String)>, Parse
 
                 headers.push((key_str, value_str));
             }
-            Ok(headers)
+            Ok(ParsedHeaders::Full(headers))
         }
-        Err(_) => Err(ParseError::InvalidFrame(
-            "invalid hpack encoding".to_string(),
-        )),
+        // TODO we might be silently ignoring real issues, but the decoder doesn't expose enough information
+        // for us to tell.
+        Err(_) => Ok(ParsedHeaders::Incomplete),
     }
 }
 
@@ -398,6 +427,28 @@ impl TypedFrame {
         ))
     }
 
+    // GOAWAY payload format
+    //  +-+-------------------------------------------------------------+
+    //  |R|                  Last-Stream-ID (31)                        |
+    //  +-+-------------------------------------------------------------+
+    //  |                      Error Code (32)                          |
+    //  +---------------------------------------------------------------+
+    //  |                  Additional Debug Data (*)                    |
+    //  +---------------------------------------------------------------+
+    fn try_parse_goaway(f: &RawFrame) -> Result<Self, ParseError> {
+        let mut cursor = Cursor::new(&f.payload);
+        let stream_id = cursor.read_u32::<NetworkEndian>()?;
+        let error_code = cursor.read_u32::<NetworkEndian>()?;
+        let debug_data = String::from_utf8_lossy(&f.payload[8..]);
+
+        Ok(TypedFrame::GoAway(
+            f.header,
+            stream_id,
+            error_code,
+            debug_data.to_string(),
+        ))
+    }
+
     fn try_parse(f: &RawFrame) -> Result<Self, ParseError> {
         match f.header.frame_type {
             FrameType::Data => Self::try_parse_data(f),
@@ -406,7 +457,7 @@ impl TypedFrame {
             FrameType::Priority => Self::try_parse_priority(f),
             FrameType::WindowUpdate => Self::try_parse_window_update(f),
             FrameType::Continuation => Self::try_parse_continuation(f),
-            FrameType::GoAway => Err(ParseError::InvalidFrame("goway".to_string())),
+            FrameType::GoAway => Self::try_parse_goaway(f),
             FrameType::Ping => Err(ParseError::InvalidFrame("ping".to_string())),
             FrameType::PushPromise => Self::try_parse_push_promise(f),
             FrameType::RstStream => Err(ParseError::InvalidFrame("rst_stream".to_string())),
@@ -479,7 +530,7 @@ impl Display for HeadersHeader {
             flags.push("end_stream=true");
         }
         if !flags.is_empty() {
-            write!(f, " [{}]", flags.join(","))
+            write!(f, "[{}]", flags.join(","))
         } else {
             Ok(())
         }
@@ -503,7 +554,7 @@ fn test_headers_header_display() {
         end_headers: true,
         padded: true,
     };
-    assert_eq!(format!("{}", f), " [end_headers=true,end_stream=true]");
+    assert_eq!(format!("{}", f), "[end_headers=true,end_stream=true]");
 }
 
 impl Display for PriorityHeader {
@@ -599,12 +650,7 @@ impl Display for TypedFrame {
                 write!(f, "{}", String::from_utf8(payload.clone()).unwrap())
             }
             TypedFrame::Headers(header, header_header, headers) => {
-                write!(f, "{}", header)?;
-                write!(f, "{}", header_header)?;
-                for (key, value) in headers {
-                    write!(f, "\n{}: {}", key, value)?;
-                }
-                Ok(())
+                write!(f, "{} {}{}", header, header_header, headers)
             }
             TypedFrame::PriorityFrame(header, priority_header) => {
                 write!(f, "{}", header)?;
@@ -623,21 +669,22 @@ impl Display for TypedFrame {
                 write!(f, " ({})", window_header)
             }
             TypedFrame::Continuation(header, continuation_header, headers) => {
-                write!(f, "{}", header)?;
-                write!(f, "{}", continuation_header)?;
-                for (key, value) in headers {
-                    write!(f, "\n{}: {}", key, value)?;
-                }
-                Ok(())
+                write!(f, "{} {}{}", header, continuation_header, headers)
             }
             TypedFrame::PushPromise(header, push_promise_header, promised_stream_id, headers) => {
-                write!(f, "{}", header)?;
-                write!(f, "{}", push_promise_header)?;
-                write!(f, " ({})", promised_stream_id)?;
-                for (key, value) in headers {
-                    write!(f, "\n{}: {}", key, value)?;
+                write!(
+                    f,
+                    "{} {} ({}){}",
+                    header, push_promise_header, promised_stream_id, headers
+                )
+            }
+            TypedFrame::GoAway(header, stream_id, error_code, error_msg) => {
+                write!(f, "{} ({}) {}", header, stream_id, error_code)?;
+                if !error_msg.is_empty() {
+                    write!(f, ": {}", error_msg)
+                } else {
+                    Ok(())
                 }
-                Ok(())
             }
         }
     }
@@ -677,10 +724,10 @@ fn test_typed_frame_display() {
             end_stream: true,
             end_headers: true,
         },
-        vec![
+        ParsedHeaders::Full(vec![
             ("a".to_string(), "b".to_string()),
             ("c".to_string(), "d".to_string()),
-        ],
+        ]),
     );
     assert_eq!(
         format!("{}", f),
