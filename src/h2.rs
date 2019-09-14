@@ -151,6 +151,109 @@ impl From<&Frame> for HeadersFrame {
     }
 }
 
+#[derive(Debug)]
+enum StreamSetting {
+    TableSize = 0x1,
+    EnablePush = 0x2,
+    MaxConcurrentStreams = 0x3,
+    InitialWindowSize = 0x4,
+    MaxFrameSize = 0x5,
+    MaxHeaderListSize = 0x6,
+}
+
+struct Setting {
+    identifier: StreamSetting,
+    value: u32,
+}
+
+enum SettingFlags {
+    Ack = 0x1,
+}
+struct SettingsFrame {
+    stream_id: u32,
+    settings: Vec<Setting>,
+    ack: bool,
+}
+
+impl From<&Frame> for SettingsFrame {
+    fn from(f: &Frame) -> Self {
+        let mut settings = Vec::new();
+        let mut cursor = Cursor::new(&f.payload);
+        while cursor.position() < f.payload.len() as u64 {
+            let identifier_val = cursor.read_u16::<NetworkEndian>().unwrap();
+
+            let identifier = match identifier_val {
+                0x1 => StreamSetting::TableSize,
+                0x2 => StreamSetting::EnablePush,
+                0x3 => StreamSetting::MaxConcurrentStreams,
+                0x4 => StreamSetting::InitialWindowSize,
+                0x5 => StreamSetting::MaxFrameSize,
+                0x6 => StreamSetting::MaxHeaderListSize,
+                _ => panic!("todo"),
+            };
+
+            let value = cursor.read_u32::<NetworkEndian>().unwrap();
+            settings.push(Setting { value, identifier });
+        }
+
+        SettingsFrame {
+            stream_id: f.stream_id,
+            settings,
+            ack: flagged(SettingFlags::Ack as u8, f.flags),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PriorityFrame {
+    stream_id: u32,
+    stream_dependency: u32,
+    exclusive: bool,
+    weight: u8,
+}
+
+impl From<&Frame> for PriorityFrame {
+    fn from(f: &Frame) -> Self {
+        let mut cursor = Cursor::new(&f.payload);
+        let dependency_with_flag = cursor.read_u32::<NetworkEndian>().unwrap();
+        let dependency = (dependency_with_flag >> 1) << 1;
+        let exclusive = dependency_with_flag != dependency;
+        let weight = cursor.read_u8().unwrap();
+
+        PriorityFrame {
+            stream_id: f.stream_id,
+            stream_dependency: dependency,
+            exclusive,
+            weight,
+        }
+    }
+}
+
+fn display_priority(
+    r: &Frame,
+    f: &PriorityFrame,
+    formatter: &mut std::fmt::Formatter<'_>,
+) -> Result<(), std::fmt::Error> {
+    display_prefix(&r, &format!("({})", f.weight), formatter)
+}
+
+fn display_settings(
+    r: &Frame,
+    f: &SettingsFrame,
+    formatter: &mut std::fmt::Formatter<'_>,
+) -> Result<(), std::fmt::Error> {
+    let kvs: Vec<String> = f
+        .settings
+        .iter()
+        .map(|s| format!("{:?}={}", s.identifier, s.value))
+        .collect();
+    display_prefix(
+        &r,
+        &format!("[{}] {}", kvs.join(","), if f.ack { "(A)" } else { "" }),
+        formatter,
+    )
+}
+
 fn display_prefix(
     f: &Frame,
     flags: &str,
@@ -226,6 +329,8 @@ impl Display for Frame {
         match self.frame_type {
             FrameType::Data => display_data(self, &DataFrame::from(self), formatter),
             FrameType::Headers => display_headers(&self, &HeadersFrame::from(self), formatter),
+            FrameType::Priority => display_priority(&self, &PriorityFrame::from(self), formatter),
+            FrameType::Settings => display_settings(&self, &SettingsFrame::from(self), formatter),
             _ => display_prefix(&self, &"".to_string(), formatter),
         }
     }
