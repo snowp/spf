@@ -31,6 +31,7 @@ pub fn stdout_output(data: &send_data_t) {
 
 pub fn do_main<F>(
     path_filter: Option<String>,
+    debug: bool,
     runnable: Arc<AtomicBool>,
     f: F,
     started: Sender<()>,
@@ -38,10 +39,14 @@ pub fn do_main<F>(
 where
     F: Fn(&send_data_t),
 {
-    let defines = match path_filter {
+    let mut defines = match path_filter {
         Some(path) => format!("#define UN_FILTER \"{}\"\n", path),
         _ => "".to_string(),
     };
+    if debug {
+        defines += "#define DEBUG_BPF\n";
+    }
+
     let code = include_str!("un.c");
     let mut module = BPF::new(&(defines + code))?;
 
@@ -67,13 +72,12 @@ where
         // Drain the received updates and invoke the output function with each value.
         while match receiver.try_recv() {
             Ok(data) => {
-                match SendStatus::from_u8(data.status) {
-                    Some(SendStatus::Ok) => f(&data),
-                    Some(status) => {
-                        let count = *failures.get(&status).unwrap_or(&0);
-                        failures.insert(status, count + 1);
+                if let Some(status) = SendStatus::from_u8(data.status) {
+                    if status == SendStatus::Ok {
+                        f(&data)
                     }
-                    _ => {}
+                    let count = *failures.get(&status).unwrap_or(&0);
+                    failures.insert(status, count + 1);
                 }
                 true
             }
@@ -226,6 +230,7 @@ mod tests {
         thread::spawn(move || {
             super::do_main(
                 Some("/tmp/spf.test".to_string()),
+                true,
                 barc_clone,
                 move |data| sender.send(data.clone()).unwrap(),
                 started_sender,

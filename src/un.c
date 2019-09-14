@@ -91,7 +91,8 @@ inline static bool cmp_un_path(struct unix_address *addr)
 #endif
 
 // Allows us to communicate why a unix_stream_sendmsg did not result in a data entry.
-enum status_t {
+enum status_t
+{
   OK,
   NO_PATH,
   NO_DATA,
@@ -158,7 +159,15 @@ inline static size_t copy_sun_path(struct unix_sock *us, struct send_data_t *dat
   return 0;
 }
 
-inline static void submit(struct pt_regs *ctx, struct send_data_t* data) {
+inline static void submit(struct pt_regs *ctx, struct send_data_t *data)
+{
+#ifndef DEBUG_BPF
+  if (data->status != OK)
+  {
+    return;
+  }
+#endif
+
   data_events.perf_submit(ctx, data, sizeof(struct send_data_t));
 }
 
@@ -190,7 +199,8 @@ inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, 
   struct sock *sock = socket->sk;
   struct unix_sock *us = unix_sk(sock);
   struct pid *peer_pid = socket->sk->sk_peer_pid;
-  if (peer_pid) {
+  if (peer_pid)
+  {
     data.peer_pid = peer_pid->numbers[0].nr;
   }
 
@@ -202,7 +212,6 @@ inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, 
     return;
   }
 
-
   if (!copy_sun_path(us, &data))
   {
     if (!copy_sun_path(unix_sk(peer), &data))
@@ -211,7 +220,9 @@ inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, 
       submit(ctx, &data);
       return;
     }
-  } else {
+  }
+  else
+  {
     data.bound = 1;
   }
 
@@ -221,7 +232,9 @@ inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, 
   if (data.msg_size)
   {
     submit(ctx, &data);
-  } else {
+  }
+  else
+  {
     data.status = NO_DATA;
   }
 }

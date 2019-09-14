@@ -29,15 +29,20 @@ fn main() {
             Arg::with_name("output")
                 .short("o")
                 .long("output")
-                .help("Output format (default, pcap)")
+                .help("Output format (default, h2)")
                 .takes_value(true),
+        )
+        .arg(
+            Arg::with_name("bpf_debug")
+            .long("bpf-debug")
+            .help("Output extra information about why calls are not traced. *NOTE*: This may increase the number of dropped packets.")
         )
         .get_matches();
 
-    let formatter = if matches.value_of("output").unwrap_or("default") == "default" {
-        bpf::stdout_output
-    } else {
-        h2::format
+    let formatter = match matches.value_of("output").unwrap_or("default") {
+        "h2" => h2::format,
+        "default" => bpf::stdout_output,
+        _ => panic!("invalid format"),
     };
 
     let runnable = Arc::new(AtomicBool::new(true));
@@ -51,6 +56,7 @@ fn main() {
     let (sender, _receiver) = mpsc::channel();
     if let Err(x) = bpf::do_main(
         matches.value_of("filter").map(str::to_string),
+        matches.value_of("bpf_debug").map(|_| true).unwrap_or(false),
         runnable,
         formatter,
         sender,
