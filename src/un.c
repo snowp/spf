@@ -223,20 +223,18 @@ inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, 
   }
   else
   {
+    // Of the socket and its peer, only the one that is bound will have a name.
     data.bound = 1;
   }
 
   data.msg_size = copy_iov(hdr, data.buffer, &data.truncated);
   data.pipe_type = hdr->msg_iter.type;
 
-  if (data.msg_size)
-  {
-    submit(ctx, &data);
-  }
-  else
-  {
+  if (!data.msg_size) {
     data.status = NO_DATA;
   }
+
+  submit(ctx, &data);
 }
 
 int un_stream_send_entry(struct pt_regs *ctx, struct socket *socket, struct msghdr *hdr, size_t s)
