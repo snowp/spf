@@ -2,9 +2,11 @@ use super::bpf;
 use byteorder::NetworkEndian;
 use byteorder::ReadBytesExt;
 use hpack::Decoder;
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::Cursor;
 use std::io::Error;
+use std::iter::FromIterator;
 use std::result::Result;
 
 #[derive(Debug)]
@@ -15,7 +17,7 @@ enum ParseError {
     IoError(std::io::Error),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum FrameType {
     Data,
     Headers,
@@ -83,72 +85,30 @@ fn flagged(f: u8, flags: u8) -> bool {
     f & flags != 0
 }
 
-#[derive(Debug)]
-struct Frame {
+#[derive(Copy, Clone)]
+struct FrameHeader {
     client: bool,
     len: usize,
-    frame_type: FrameType, // turn into enum
-    flags: u8,
+    raw_flags: u8,
+    frame_type: FrameType,
     stream_id: u32,
+}
+
+struct RawFrame {
+    header: FrameHeader,
     payload: Vec<u8>,
 }
 
-#[derive(Debug)]
-struct DataFrame {
-    stream_id: u32,
+struct DataHeader {
     end_stream: bool,
     padded: bool,
-    payload: Vec<u8>,
 }
 
-fn remove_padding(payload: &Vec<u8>, padded: bool) -> Vec<u8> {
-    let (start, stop) = if padded {
-        let mut c = Cursor::new(&payload);
-        let pad_len = c.read_u32::<NetworkEndian>().unwrap();
-        (4, payload.len() - pad_len as usize)
-    } else {
-        (0, payload.len())
-    };
-
-    payload[start..stop].to_vec()
-}
-
-impl From<&Frame> for DataFrame {
-    fn from(f: &Frame) -> Self {
-        let padded = flagged(DataFlag::Padded as u8, f.flags);
-
-        DataFrame {
-            stream_id: f.stream_id,
-            end_stream: flagged(DataFlag::EndStream as u8, f.flags),
-            padded,
-            payload: remove_padding(&f.payload, padded),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct HeadersFrame {
-    stream_id: u32,
+struct HeadersHeader {
     end_stream: bool,
     end_headers: bool,
     padded: bool,
     priority: bool,
-    payload: Vec<u8>,
-}
-
-impl From<&Frame> for HeadersFrame {
-    fn from(f: &Frame) -> Self {
-        let padded = flagged(HeadersFlag::Padded as u8, f.flags);
-
-        HeadersFrame {
-            stream_id: f.stream_id,
-            end_stream: flagged(HeadersFlag::EndStream as u8, f.flags),
-            end_headers: flagged(HeadersFlag::EndHeaders as u8, f.flags),
-            priority: flagged(HeadersFlag::Priority as u8, f.flags), // TODO handle this
-            padded,
-            payload: remove_padding(&f.payload, padded),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -161,6 +121,12 @@ enum StreamSetting {
     MaxHeaderListSize = 0x6,
 }
 
+trait ParsableFrame<'a> {
+    fn try_parse(f: &'a RawFrame) -> Result<&dyn Display, Error>
+    where
+        Self: Sized;
+}
+
 struct Setting {
     identifier: StreamSetting,
     value: u32,
@@ -169,19 +135,95 @@ struct Setting {
 enum SettingFlags {
     Ack = 0x1,
 }
-struct SettingsFrame {
-    stream_id: u32,
-    settings: Vec<Setting>,
+
+struct SettingsHeader {
     ack: bool,
 }
 
-impl From<&Frame> for SettingsFrame {
-    fn from(f: &Frame) -> Self {
+struct PriorityHeader {
+    stream_dependency: u32,
+    exclusive: bool,
+    weight: u8,
+}
+
+enum TypedFrame {
+    Data(FrameHeader, DataHeader, Vec<u8>),
+    Headers(FrameHeader, HeadersHeader, HashMap<String, String>),
+    SettingsFrame(FrameHeader, SettingsHeader, Vec<Setting>),
+    PriorityFrame(FrameHeader, PriorityHeader),
+    WindowUpdate(FrameHeader, u32),
+}
+
+fn remove_padding(payload: &Vec<u8>, padded: bool) -> Result<Vec<u8>, Error> {
+    let (start, stop) = if padded {
+        let mut c = Cursor::new(&payload);
+        let pad_len = c.read_u32::<NetworkEndian>()?;
+        (4, payload.len() - pad_len as usize)
+    } else {
+        (0, payload.len())
+    };
+
+    Ok(payload[start..stop].to_vec())
+}
+
+impl TypedFrame {
+    fn try_parse_data(f: &RawFrame) -> Result<Self, Error> {
+        let padded = flagged(DataFlag::Padded as u8, f.header.raw_flags);
+        let end_stream = flagged(DataFlag::EndStream as u8, f.header.raw_flags);
+        let data_header = DataHeader { end_stream, padded };
+        Ok(TypedFrame::Data(
+            f.header,
+            data_header,
+            remove_padding(&f.payload, padded)?,
+        ))
+    }
+
+    fn try_parse_headers(f: &RawFrame) -> Result<Self, Error> {
+        let padded = flagged(HeadersFlag::Padded as u8, f.header.raw_flags);
+        let end_stream = flagged(HeadersFlag::EndStream as u8, f.header.raw_flags);
+        let end_headers = flagged(HeadersFlag::EndHeaders as u8, f.header.raw_flags);
+        let priority = flagged(HeadersFlag::Priority as u8, f.header.raw_flags); // TODO handle this
+        let payload = remove_padding(&f.payload, padded)?;
+
+        let mut d = Decoder::new();
+        let headers = match d.decode(&payload) {
+            Ok(decoded) => {
+                let mut headers = HashMap::new();
+                for (key, value) in decoded {
+                    let key_str = String::from_utf8(key)
+                        .map_err(|_| Error::new(std::io::ErrorKind::Other, "invalid header key"))?;
+                    let value_str = String::from_utf8(value)
+                        .map_err(|_| Error::new(std::io::ErrorKind::Other, "invalid header key"))?;
+
+                    headers.insert(key_str, value_str);
+                }
+                Ok(headers)
+            }
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "invalid hpack encoding",
+            )),
+        }?;
+
+        Ok(TypedFrame::Headers(
+            f.header,
+            HeadersHeader {
+                padded,
+                end_stream,
+                end_headers,
+                priority,
+            },
+            headers,
+        ))
+    }
+
+    fn try_parse_settings(f: &RawFrame) -> Result<Self, Error> {
         let mut settings = Vec::new();
         let mut cursor = Cursor::new(&f.payload);
         while cursor.position() < f.payload.len() as u64 {
-            let identifier_val = cursor.read_u16::<NetworkEndian>().unwrap();
+            let identifier_val = cursor.read_u16::<NetworkEndian>()?;
 
+            // TODO handle this stuff better, get the derive macro to work
             let identifier = match identifier_val {
                 0x1 => StreamSetting::TableSize,
                 0x2 => StreamSetting::EnablePush,
@@ -189,151 +231,342 @@ impl From<&Frame> for SettingsFrame {
                 0x4 => StreamSetting::InitialWindowSize,
                 0x5 => StreamSetting::MaxFrameSize,
                 0x6 => StreamSetting::MaxHeaderListSize,
-                _ => panic!("todo"),
+                _ => {
+                    return Err(Error::new(
+                        std::io::ErrorKind::Other,
+                        "invalid settings identifier",
+                    ))
+                }
             };
 
-            let value = cursor.read_u32::<NetworkEndian>().unwrap();
+            let value = cursor.read_u32::<NetworkEndian>()?;
             settings.push(Setting { value, identifier });
         }
 
-        SettingsFrame {
-            stream_id: f.stream_id,
+        let ack = flagged(SettingFlags::Ack as u8, f.header.raw_flags);
+        Ok(TypedFrame::SettingsFrame(
+            f.header,
+            SettingsHeader { ack },
             settings,
-            ack: flagged(SettingFlags::Ack as u8, f.flags),
-        }
+        ))
     }
-}
 
-#[derive(Debug)]
-struct PriorityFrame {
-    stream_id: u32,
-    stream_dependency: u32,
-    exclusive: bool,
-    weight: u8,
-}
-
-impl From<&Frame> for PriorityFrame {
-    fn from(f: &Frame) -> Self {
+    fn try_parse_priority(f: &RawFrame) -> Result<Self, Error> {
         let mut cursor = Cursor::new(&f.payload);
-        let dependency_with_flag = cursor.read_u32::<NetworkEndian>().unwrap();
-        let dependency = (dependency_with_flag >> 1) << 1;
-        let exclusive = dependency_with_flag != dependency;
-        let weight = cursor.read_u8().unwrap();
+        let dependency_with_flag = cursor.read_u32::<NetworkEndian>()?;
+        let stream_dependency = (dependency_with_flag >> 1) << 1;
+        let exclusive = dependency_with_flag != stream_dependency;
+        let weight = cursor.read_u8()?;
 
-        PriorityFrame {
-            stream_id: f.stream_id,
-            stream_dependency: dependency,
-            exclusive,
-            weight,
+        Ok(TypedFrame::PriorityFrame(
+            f.header,
+            PriorityHeader {
+                stream_dependency,
+                exclusive,
+                weight,
+            },
+        ))
+    }
+
+    fn try_parse_window_update(f: &RawFrame) -> Result<Self, Error> {
+        let mut cursor = Cursor::new(&f.payload);
+        let increment = cursor.read_u32::<NetworkEndian>()?;
+        Ok(TypedFrame::WindowUpdate(f.header, (increment << 1) >> 1))
+    }
+
+    fn try_parse(f: &RawFrame) -> Result<Self, Error> {
+        match f.header.frame_type {
+            FrameType::Data => Self::try_parse_data(f),
+            FrameType::Headers => Self::try_parse_headers(f),
+            FrameType::Settings => Self::try_parse_settings(f),
+            FrameType::Priority => Self::try_parse_priority(f),
+            FrameType::WindowUpdate => Self::try_parse_window_update(f),
+            _ => panic!(),
         }
     }
 }
 
-fn display_priority(
-    r: &Frame,
-    f: &PriorityFrame,
-    formatter: &mut std::fmt::Formatter<'_>,
-) -> Result<(), std::fmt::Error> {
-    display_prefix(&r, &format!("({})", f.weight), formatter)
-}
-
-fn display_settings(
-    r: &Frame,
-    f: &SettingsFrame,
-    formatter: &mut std::fmt::Formatter<'_>,
-) -> Result<(), std::fmt::Error> {
-    let kvs: Vec<String> = f
-        .settings
-        .iter()
-        .map(|s| format!("{:?}={}", s.identifier, s.value))
-        .collect();
-    display_prefix(
-        &r,
-        &format!("[{}] {}", kvs.join(","), if f.ack { "(A)" } else { "" }),
-        formatter,
-    )
-}
-
-fn display_prefix(
-    f: &Frame,
-    flags: &str,
-    formatter: &mut std::fmt::Formatter<'_>,
-) -> Result<(), std::fmt::Error> {
-    let direction = if f.client { ">>" } else { "<<" };
-    write!(
-        formatter,
-        "{} ({}) {} {}",
-        direction, f.stream_id, f.frame_type, flags
-    )
-}
-
-fn display_data(
-    r: &Frame,
-    f: &DataFrame,
-    formatter: &mut std::fmt::Formatter<'_>,
-) -> Result<(), std::fmt::Error> {
-    let flags = if f.end_stream {
-        "[end_stream=true]"
-    } else {
-        ""
-    };
-
-    display_prefix(&r, &flags, formatter)?;
-
-    writeln!(formatter)?;
-    write!(
-        formatter,
-        "{}",
-        String::from_utf8(f.payload.clone()).unwrap()
-    )
-}
-
-fn display_headers(
-    r: &Frame,
-    f: &HeadersFrame,
-    formatter: &mut std::fmt::Formatter<'_>,
-) -> Result<(), std::fmt::Error> {
-    let mut flags = Vec::new();
-    if f.end_headers {
-        flags.push("end_headers=true");
+impl Display for FrameHeader {
+    fn fmt(self: &Self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        let direction = if self.client { ">>" } else { "<<" };
+        write!(f, "{} ({}) {}", direction, self.stream_id, self.frame_type)
     }
-    if f.end_stream {
-        flags.push("end_stream=true");
+}
+
+#[test]
+fn test_frame_header_display() {
+    {
+        let f = FrameHeader {
+            client: true,
+            stream_id: 1,
+            frame_type: FrameType::Data,
+            raw_flags: 0,
+            len: 0,
+        };
+        assert_eq!(format!("{}", f), ">> (1) DATA");
     }
-    let flag_str = if flags.is_empty() {
-        "".to_string()
-    } else {
-        format!("[{}]", flags.join(","))
+    let f = FrameHeader {
+        client: false,
+        stream_id: 2,
+        frame_type: FrameType::Headers,
+        raw_flags: 0,
+        len: 0,
     };
-    display_prefix(&r, &flag_str, formatter)?;
-    writeln!(formatter)?;
-    let mut d = Decoder::new();
-    match d.decode(&f.payload) {
-        Ok(decoded) => {
-            for (key, value) in decoded {
-                writeln!(
-                    formatter,
-                    "{}: {}",
-                    String::from_utf8(key).unwrap(),
-                    String::from_utf8(value).unwrap()
-                )?;
-            }
+    assert_eq!(format!("{}", f), "<< (2) HEADERS");
+}
+
+impl Display for DataHeader {
+    fn fmt(self: &Self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        if self.end_stream {
+            write!(f, " [end_stream=true]")
+        } else {
             Ok(())
         }
-        Err(_) => Err(std::fmt::Error),
     }
 }
 
-impl Display for Frame {
-    fn fmt(self: &Self, formatter: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        match self.frame_type {
-            FrameType::Data => display_data(self, &DataFrame::from(self), formatter),
-            FrameType::Headers => display_headers(&self, &HeadersFrame::from(self), formatter),
-            FrameType::Priority => display_priority(&self, &PriorityFrame::from(self), formatter),
-            FrameType::Settings => display_settings(&self, &SettingsFrame::from(self), formatter),
-            _ => display_prefix(&self, &"".to_string(), formatter),
+#[test]
+fn test_data_header_display() {
+    {
+        let f = DataHeader {
+            end_stream: false,
+            padded: false,
+        };
+        assert_eq!(format!("{}", f), "");
+    }
+    let f = DataHeader {
+        end_stream: true,
+        padded: true,
+    };
+    assert_eq!(format!("{}", f), " [end_stream=true]");
+}
+
+impl Display for HeadersHeader {
+    fn fmt(self: &Self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        let mut flags = Vec::new();
+        if self.end_headers {
+            flags.push("end_headers=true");
+        }
+        if self.end_stream {
+            flags.push("end_stream=true");
+        }
+        if !flags.is_empty() {
+            write!(f, " [{}]", flags.join(","))
+        } else {
+            Ok(())
         }
     }
+}
+
+#[test]
+fn test_headers_header_display() {
+    {
+        let f = HeadersHeader {
+            priority: false,
+            end_stream: false,
+            end_headers: false,
+            padded: false,
+        };
+        assert_eq!(format!("{}", f), "");
+    }
+    let f = HeadersHeader {
+        priority: false,
+        end_stream: true,
+        end_headers: true,
+        padded: true,
+    };
+    assert_eq!(format!("{}", f), " [end_headers=true,end_stream=true]");
+}
+
+impl Display for PriorityHeader {
+    fn fmt(self: &Self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(
+            f,
+            " ({}) ({}) ({})",
+            self.weight, self.stream_dependency, self.exclusive
+        )
+    }
+}
+
+#[test]
+fn test_priority_header_display() {
+    {
+        let f = PriorityHeader {
+            weight: 10,
+            stream_dependency: 15,
+            exclusive: false,
+        };
+        assert_eq!(format!("{}", f), " (10) (15) (false)");
+    }
+    let f = PriorityHeader {
+        weight: 10,
+        stream_dependency: 15,
+        exclusive: true,
+    };
+    assert_eq!(format!("{}", f), " (10) (15) (true)");
+}
+
+impl Display for SettingsHeader {
+    fn fmt(self: &Self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        if self.ack {
+            write!(f, " [Ack]")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn test_settings_header_display() {
+    {
+        let f = SettingsHeader { ack: true };
+        assert_eq!(format!("{}", f), " [Ack]");
+    }
+    let f = SettingsHeader { ack: false };
+    assert_eq!(format!("{}", f), "");
+}
+
+impl Display for RawFrame {
+    fn fmt(self: &Self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "{}", self.header)
+    }
+}
+
+impl Display for TypedFrame {
+    fn fmt(self: &Self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match self {
+            TypedFrame::Data(header, data_header, payload) => {
+                write!(f, "{}", header)?;
+                writeln!(f, "{}", data_header)?;
+                write!(f, "{}", String::from_utf8(payload.clone()).unwrap())
+            }
+            TypedFrame::Headers(header, header_header, headers) => {
+                write!(f, "{}", header)?;
+                writeln!(f, "{}", header_header)?;
+                // TOOD this is gross
+                let mut keys = headers.keys().map(|x| x.clone()).collect::<Vec<String>>();
+                keys.sort();
+                for key in keys {
+                    writeln!(f, "{}: {}", key, headers.get(&key).unwrap())?;
+                }
+                Ok(())
+            }
+            TypedFrame::PriorityFrame(header, priority_header) => {
+                write!(f, "{}", header)?;
+                write!(f, "{}", priority_header)
+            }
+            TypedFrame::SettingsFrame(header, settings_header, settings) => {
+                write!(f, "{}", header)?;
+                writeln!(f, "{}", settings_header)?;
+                for setting in settings {
+                    writeln!(f, "{:?}={}", setting.identifier, setting.value)?;
+                }
+                Ok(())
+            }
+            TypedFrame::WindowUpdate(header, window_header) => {
+                write!(f, "{}", header)?;
+                write!(f, " ({})", window_header)
+            }
+        }
+    }
+}
+
+#[test]
+fn test_typed_frame_display() {
+    {
+        let f = TypedFrame::Data(
+            FrameHeader {
+                client: true,
+                stream_id: 1,
+                len: 2,
+                frame_type: FrameType::Data,
+                raw_flags: 0,
+            },
+            DataHeader {
+                padded: false,
+                end_stream: false,
+            },
+            "abc".to_string().into(),
+        );
+        assert_eq!(format!("{}", f), ">> (1) DATA\nabc");
+    }
+
+    let f = TypedFrame::Headers(
+        FrameHeader {
+            client: true,
+            stream_id: 1,
+            len: 2,
+            frame_type: FrameType::Headers,
+            raw_flags: 0,
+        },
+        HeadersHeader {
+            priority: true,
+            padded: false,
+            end_stream: true,
+            end_headers: true,
+        },
+        HashMap::from_iter(vec![
+            ("a".to_string(), "b".to_string()),
+            ("c".to_string(), "d".to_string()),
+        ]),
+    );
+    assert_eq!(
+        format!("{}", f),
+        ">> (1) HEADERS [end_headers=true,end_stream=true]\na: b\nc: d\n"
+    );
+
+    let f = TypedFrame::PriorityFrame(
+        FrameHeader {
+            client: true,
+            stream_id: 1,
+            len: 2,
+            frame_type: FrameType::Priority,
+            raw_flags: 0,
+        },
+        PriorityHeader {
+            exclusive: true,
+            stream_dependency: 100,
+            weight: 150,
+        },
+    );
+    assert_eq!(format!("{}", f), ">> (1) PRIORITY (150) (100) (true)");
+
+    let f = TypedFrame::SettingsFrame(
+        FrameHeader {
+            client: true,
+            stream_id: 1,
+            len: 2,
+            frame_type: FrameType::Settings,
+            raw_flags: 0,
+        },
+        SettingsHeader { ack: true },
+        vec![
+            Setting {
+                identifier: StreamSetting::EnablePush,
+                value: 0,
+            },
+            Setting {
+                identifier: StreamSetting::InitialWindowSize,
+                value: 100,
+            },
+        ],
+    );
+    assert_eq!(
+        format!("{}", f),
+        ">> (1) SETTINGS [Ack]\nEnablePush=0\nInitialWindowSize=100\n"
+    );
+
+    let f = TypedFrame::WindowUpdate(
+        FrameHeader {
+            client: true,
+            stream_id: 1,
+            len: 2,
+            frame_type: FrameType::WindowUpdate,
+            raw_flags: 0,
+        },
+        100,
+    );
+    assert_eq!(format!("{}", f), ">> (1) WINDOWUPDATE (100)");
 }
 
 impl From<Error> for ParseError {
@@ -342,7 +575,7 @@ impl From<Error> for ParseError {
     }
 }
 
-impl Frame {
+impl RawFrame {
     fn try_parse(client: bool, d: &[u8], buf_len: usize) -> Result<(Self, usize), ParseError> {
         if buf_len < 9 {
             return Err(ParseError::TooSmall);
@@ -358,12 +591,14 @@ impl Frame {
             Err(ParseError::OutOfBounds)
         } else {
             Ok((
-                Frame {
-                    client,
-                    len: len as usize,
-                    frame_type,
-                    flags,
-                    stream_id,
+                RawFrame {
+                    header: FrameHeader {
+                        client,
+                        len: len as usize,
+                        frame_type,
+                        raw_flags: flags,
+                        stream_id,
+                    },
                     payload: d[9..(9 + len as usize)].into(),
                 },
                 9 + len as usize,
@@ -373,7 +608,7 @@ impl Frame {
 }
 
 pub fn format(data: &bpf::send_data_t) {
-    // skip preamble
+    // Skip the preamble: this is sent during connection setup for HTTP/2.
     let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
     let mut itr = if data.buffer[0..preface.len()] == *preface {
@@ -382,20 +617,29 @@ pub fn format(data: &bpf::send_data_t) {
         0
     };
 
+    // We assume that each data chunk contains zero or more HTTP/2 frames. We attempt
+    // to parse it as a typed HTTP/2 frame and print it, falling back to printing information
+    // about the raw frame.
     while itr < data.msg_size as usize {
-        match Frame::try_parse(
+        let (raw_frame, size) = match RawFrame::try_parse(
             data.bound == 0,
             &data.buffer[itr..],
             data.msg_size as usize - itr,
         ) {
             Err(e) => {
+                // Invalid frame, skip output.
                 eprintln!("failed to parse frame {:?}", e);
                 return;
             }
-            Ok((frame, size)) => {
-                println! {"{}", frame};
-                itr += size;
-            }
+            Ok((raw_frame, size)) => (raw_frame, size),
+        };
+
+        itr += size;
+
+        if let Ok(typed_frame) = TypedFrame::try_parse(&raw_frame) {
+            println!("{}", typed_frame);
+        } else {
+            println!("{}", raw_frame);
         }
     }
 }
