@@ -2,18 +2,16 @@ use super::bpf;
 use byteorder::NetworkEndian;
 use byteorder::ReadBytesExt;
 use hpack::Decoder;
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::Cursor;
 use std::io::Error;
-use std::iter::FromIterator;
 use std::result::Result;
 
 #[derive(Debug)]
 enum ParseError {
     OutOfBounds,
     TooSmall,
-    InvalidFrame,
+    InvalidFrame(String),
     IoError(std::io::Error),
 }
 
@@ -44,7 +42,7 @@ impl FrameType {
             0x7 => Ok(FrameType::GoAway),
             0x8 => Ok(FrameType::WindowUpdate),
             0x9 => Ok(FrameType::Continuation),
-            _ => Err(ParseError::InvalidFrame),
+            _ => Err(ParseError::InvalidFrame("invalid frame type".to_string())),
         }
     }
 }
@@ -148,13 +146,13 @@ struct PriorityHeader {
 
 enum TypedFrame {
     Data(FrameHeader, DataHeader, Vec<u8>),
-    Headers(FrameHeader, HeadersHeader, HashMap<String, String>),
+    Headers(FrameHeader, HeadersHeader, Vec<(String, String)>),
     SettingsFrame(FrameHeader, SettingsHeader, Vec<Setting>),
     PriorityFrame(FrameHeader, PriorityHeader),
     WindowUpdate(FrameHeader, u32),
 }
 
-fn remove_padding(payload: &Vec<u8>, padded: bool) -> Result<Vec<u8>, Error> {
+fn remove_padding(payload: &[u8], padded: bool) -> Result<Vec<u8>, Error> {
     let (start, stop) = if padded {
         let mut c = Cursor::new(&payload);
         let pad_len = c.read_u32::<NetworkEndian>()?;
@@ -167,7 +165,7 @@ fn remove_padding(payload: &Vec<u8>, padded: bool) -> Result<Vec<u8>, Error> {
 }
 
 impl TypedFrame {
-    fn try_parse_data(f: &RawFrame) -> Result<Self, Error> {
+    fn try_parse_data(f: &RawFrame) -> Result<Self, ParseError> {
         let padded = flagged(DataFlag::Padded as u8, f.header.raw_flags);
         let end_stream = flagged(DataFlag::EndStream as u8, f.header.raw_flags);
         let data_header = DataHeader { end_stream, padded };
@@ -178,7 +176,7 @@ impl TypedFrame {
         ))
     }
 
-    fn try_parse_headers(f: &RawFrame) -> Result<Self, Error> {
+    fn try_parse_headers(f: &RawFrame) -> Result<Self, ParseError> {
         let padded = flagged(HeadersFlag::Padded as u8, f.header.raw_flags);
         let end_stream = flagged(HeadersFlag::EndStream as u8, f.header.raw_flags);
         let end_headers = flagged(HeadersFlag::EndHeaders as u8, f.header.raw_flags);
@@ -188,14 +186,14 @@ impl TypedFrame {
         let mut d = Decoder::new();
         let headers = match d.decode(&payload) {
             Ok(decoded) => {
-                let mut headers = HashMap::new();
+                let mut headers = Vec::new();
                 for (key, value) in decoded {
                     let key_str = String::from_utf8(key)
                         .map_err(|_| Error::new(std::io::ErrorKind::Other, "invalid header key"))?;
                     let value_str = String::from_utf8(value)
                         .map_err(|_| Error::new(std::io::ErrorKind::Other, "invalid header key"))?;
 
-                    headers.insert(key_str, value_str);
+                    headers.push((key_str, value_str));
                 }
                 Ok(headers)
             }
@@ -217,7 +215,7 @@ impl TypedFrame {
         ))
     }
 
-    fn try_parse_settings(f: &RawFrame) -> Result<Self, Error> {
+    fn try_parse_settings(f: &RawFrame) -> Result<Self, ParseError> {
         let mut settings = Vec::new();
         let mut cursor = Cursor::new(&f.payload);
         while cursor.position() < f.payload.len() as u64 {
@@ -232,9 +230,8 @@ impl TypedFrame {
                 0x5 => StreamSetting::MaxFrameSize,
                 0x6 => StreamSetting::MaxHeaderListSize,
                 _ => {
-                    return Err(Error::new(
-                        std::io::ErrorKind::Other,
-                        "invalid settings identifier",
+                    return Err(ParseError::InvalidFrame(
+                        "invalid settings identifier".to_string(),
                     ))
                 }
             };
@@ -251,7 +248,7 @@ impl TypedFrame {
         ))
     }
 
-    fn try_parse_priority(f: &RawFrame) -> Result<Self, Error> {
+    fn try_parse_priority(f: &RawFrame) -> Result<Self, ParseError> {
         let mut cursor = Cursor::new(&f.payload);
         let dependency_with_flag = cursor.read_u32::<NetworkEndian>()?;
         let stream_dependency = (dependency_with_flag >> 1) << 1;
@@ -268,13 +265,13 @@ impl TypedFrame {
         ))
     }
 
-    fn try_parse_window_update(f: &RawFrame) -> Result<Self, Error> {
+    fn try_parse_window_update(f: &RawFrame) -> Result<Self, ParseError> {
         let mut cursor = Cursor::new(&f.payload);
         let increment = cursor.read_u32::<NetworkEndian>()?;
         Ok(TypedFrame::WindowUpdate(f.header, (increment << 1) >> 1))
     }
 
-    fn try_parse(f: &RawFrame) -> Result<Self, Error> {
+    fn try_parse(f: &RawFrame) -> Result<Self, ParseError> {
         match f.header.frame_type {
             FrameType::Data => Self::try_parse_data(f),
             FrameType::Headers => Self::try_parse_headers(f),
@@ -442,12 +439,9 @@ impl Display for TypedFrame {
             }
             TypedFrame::Headers(header, header_header, headers) => {
                 write!(f, "{}", header)?;
-                writeln!(f, "{}", header_header)?;
-                // TOOD this is gross
-                let mut keys = headers.keys().map(|x| x.clone()).collect::<Vec<String>>();
-                keys.sort();
-                for key in keys {
-                    writeln!(f, "{}: {}", key, headers.get(&key).unwrap())?;
+                write!(f, "{}", header_header)?;
+                for (key, value) in headers {
+                    write!(f, "\n{}: {}", key, value)?;
                 }
                 Ok(())
             }
@@ -457,9 +451,9 @@ impl Display for TypedFrame {
             }
             TypedFrame::SettingsFrame(header, settings_header, settings) => {
                 write!(f, "{}", header)?;
-                writeln!(f, "{}", settings_header)?;
+                write!(f, "{}", settings_header)?;
                 for setting in settings {
-                    writeln!(f, "{:?}={}", setting.identifier, setting.value)?;
+                    write!(f, "\n{:?}={}", setting.identifier, setting.value)?;
                 }
                 Ok(())
             }
@@ -553,7 +547,7 @@ fn test_typed_frame_display() {
     );
     assert_eq!(
         format!("{}", f),
-        ">> (1) SETTINGS [Ack]\nEnablePush=0\nInitialWindowSize=100\n"
+        ">> (1) SETTINGS [Ack]\nEnablePush=0\nInitialWindowSize=100"
     );
 
     let f = TypedFrame::WindowUpdate(
