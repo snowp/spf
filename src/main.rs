@@ -55,8 +55,8 @@ fn main() {
         formatter,
         sender,
     ) {
-            eprintln!("Error: {}", x);
-            eprintln!("{}", x.backtrace());
-            std::process::exit(1);
+        eprintln!("Error: {}", x);
+        eprintln!("{}", x.backtrace());
+        std::process::exit(1);
     }
 }

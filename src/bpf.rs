@@ -72,7 +72,7 @@ where
                     Some(status) => {
                         let count = *failures.get(&status).unwrap_or(&0);
                         failures.insert(status, count + 1);
-                    },
+                    }
                     _ => {}
                 }
                 true
@@ -127,7 +127,7 @@ pub struct send_data_t {
     pub status: u8,
 }
 
-#[derive(Debug,Hash, Eq, PartialEq)]
+#[derive(Debug, Hash, Eq, PartialEq)]
 enum SendStatus {
     Ok,
     NoPath,
@@ -136,18 +136,16 @@ enum SendStatus {
 }
 
 impl SendStatus {
-    fn from_u8(d :u8) -> Option<Self> {
+    fn from_u8(d: u8) -> Option<Self> {
         match d {
-
-    0x0 => Some(SendStatus::Ok),
-    0x1 => Some(SendStatus::NoPath),
-    0x2 => Some(SendStatus::NoData),
-    0x3 => Some(SendStatus::NotAfUnix),
-    _ =>  None
+            0x0 => Some(SendStatus::Ok),
+            0x1 => Some(SendStatus::NoPath),
+            0x2 => Some(SendStatus::NoData),
+            0x3 => Some(SendStatus::NotAfUnix),
+            _ => None,
         }
     }
 }
-
 
 fn parse_struct<T>(x: &[u8]) -> T {
     unsafe { ptr::read(x.as_ptr() as *const T) }
