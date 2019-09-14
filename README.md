@@ -19,10 +19,12 @@ Fix the above limitations:
   need to be batched for some period instead of outputted immediately. For example, a set of moving windows could be used to allow
   each event to wait for some time for new frames:
 
+```
   A                    B       C
   |--------------------|-------|
   |            sort            |
   |        output      |
+```
 
   All events in the sort window are sorted, then all events that fall into the output window are outputted. This allows the events
   between B and C to be compared with future events once we get more events or the window times out.
