@@ -11,6 +11,8 @@ use std::result::Result;
 enum ParseError {
     OutOfBounds,
     TooSmall,
+    FrameSizeError,
+    UnknownFrameType(u8),
     InvalidFrame(String),
     IoError(std::io::Error),
 }
@@ -42,10 +44,7 @@ impl FrameType {
             0x7 => Ok(FrameType::GoAway),
             0x8 => Ok(FrameType::WindowUpdate),
             0x9 => Ok(FrameType::Continuation),
-            _ => Err(ParseError::InvalidFrame(format!(
-                "invalid frame type {}",
-                d
-            ))),
+            _ => Err(ParseError::UnknownFrameType(d)),
         }
     }
 }
@@ -146,6 +145,7 @@ enum StreamSetting {
     InitialWindowSize = 0x4,
     MaxFrameSize = 0x5,
     MaxHeaderListSize = 0x6,
+    Unknown = 0x0,
 }
 
 // Meaning of flags set on a PRIORITY frame.
@@ -327,6 +327,10 @@ impl TypedFrame {
     //
     // The SETTINGS payload contains zero or more identifier-value pairs.
     fn try_parse_settings(f: &RawFrame) -> Result<Self, ParseError> {
+        if f.payload.len() % 6 != 0 {
+            return Err(ParseError::FrameSizeError);
+        }
+
         let mut settings = Vec::new();
         let mut cursor = Cursor::new(&f.payload);
         while cursor.position() < f.payload.len() as u64 {
@@ -340,12 +344,7 @@ impl TypedFrame {
                 0x4 => StreamSetting::InitialWindowSize,
                 0x5 => StreamSetting::MaxFrameSize,
                 0x6 => StreamSetting::MaxHeaderListSize,
-                _ => {
-                    return Err(ParseError::InvalidFrame(format!(
-                        "invalid settings identifier {}",
-                        identifier_val
-                    )))
-                }
+                _ => StreamSetting::Unknown,
             };
 
             let value = cursor.read_u32::<NetworkEndian>()?;
@@ -367,6 +366,10 @@ impl TypedFrame {
     //  |   Weight (8)  |
     //  +-+-------------+
     fn try_parse_priority(f: &RawFrame) -> Result<Self, ParseError> {
+        if f.payload.len() != 5 {
+            return Err(ParseError::FrameSizeError);
+        }
+
         let mut cursor = Cursor::new(&f.payload);
         let dependency_with_flag = cursor.read_u32::<NetworkEndian>()?;
         let stream_dependency = (dependency_with_flag >> 1) << 1;
@@ -388,6 +391,10 @@ impl TypedFrame {
     //  |R|              Window Size Increment (31)                     |
     //  +-+-------------------------------------------------------------+
     fn try_parse_window_update(f: &RawFrame) -> Result<Self, ParseError> {
+        if f.payload.len() != 4 {
+            return Err(ParseError::FrameSizeError);
+        }
+
         let mut cursor = Cursor::new(&f.payload);
         let increment = cursor.read_u32::<NetworkEndian>()?;
         Ok(TypedFrame::WindowUpdate(f.header, (increment << 1) >> 1))
@@ -462,9 +469,10 @@ impl TypedFrame {
     //  |                                                               |
     //  +---------------------------------------------------------------+
     fn try_parse_ping(f: &RawFrame) -> Result<Self, ParseError> {
-        if f.payload.len() < 8 {
-            return Err(ParseError::TooSmall);
+        if f.payload.len() != 8 {
+            return Err(ParseError::FrameSizeError);
         }
+
         Ok(TypedFrame::Ping(f.header, f.payload[0..8].into()))
     }
 
@@ -473,6 +481,10 @@ impl TypedFrame {
     //  |                        Error Code (32)                        |
     //  +---------------------------------------------------------------+
     fn try_parse_rst_stream(f: &RawFrame) -> Result<Self, ParseError> {
+        if f.payload.len() != 4 {
+            return Err(ParseError::FrameSizeError);
+        }
+
         let mut cursor = Cursor::new(&f.payload);
         let error_code = cursor.read_u32::<NetworkEndian>()?;
 
