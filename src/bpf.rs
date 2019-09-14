@@ -101,14 +101,16 @@ fn socket_name(x: &[u8], len: Option<usize>) -> String {
 #[repr(C)]
 #[derive(Clone)]
 pub struct send_data_t {
-    pid: u32,
-    peer_pid: u32,
-    msg_size: u64,
-    pipe_type: u64,
-    truncated: u8,
-    buffer: [u8; 256],
-    sun_path: [u8; 64],
-    path_size: u8,
+    pub pid: u32,
+    pub peer_pid: u32,
+    pub msg_size: u64,
+    pub pipe_type: u64,
+    pub truncated: u8,
+    pub buffer: [u8; 256],
+    pub sun_path: [u8; 64],
+    pub path_size: u8,
+    pub time_ns: u64,
+    pub bound: u8,
 }
 
 fn parse_struct<T>(x: &[u8]) -> T {

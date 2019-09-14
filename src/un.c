@@ -100,6 +100,9 @@ struct send_data_t
   char buffer[READ_BUFFER_SIZE];
   char sun_path[64];
   u8 path_len;
+  u64 time_ns;
+  // Whether this is sent to the bound side of the unix socket (i.e. the "server" side).
+  u8 bound;
 };
 
 BPF_PERF_OUTPUT(data_events);
@@ -153,6 +156,7 @@ inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, 
 
   size_t pid_tgid = bpf_get_current_pid_tgid();
   data.pid = (u32)(pid_tgid >> 32);
+  data.time_ns = bpf_ktime_get_ns();
 
   // Homemade ASSERT: copy_iov assumes that the size of the buffer is READ_BUFFER_SIZE. The for
   // loop is optimized out so as long as the condition is true the program will be valid.
@@ -188,6 +192,8 @@ inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, 
     {
       return;
     }
+  } else {
+    data.bound = 1;
   }
 
   data.msg_size = copy_iov(hdr, data.buffer, &data.truncated);
