@@ -90,6 +90,14 @@ inline static bool cmp_un_path(struct unix_address *addr)
   }
 #endif
 
+// Allows us to communicate why a unix_stream_sendmsg did not result in a data entry.
+enum status_t {
+  OK,
+  NO_PATH,
+  NO_DATA,
+  NOT_AF_UNIX
+};
+
 struct send_data_t
 {
   u32 pid;
@@ -103,6 +111,7 @@ struct send_data_t
   u64 time_ns;
   // Whether this is sent to the bound side of the unix socket (i.e. the "server" side).
   u8 bound;
+  u8 status;
 };
 
 BPF_PERF_OUTPUT(data_events);
@@ -149,6 +158,10 @@ inline static size_t copy_sun_path(struct unix_sock *us, struct send_data_t *dat
   return 0;
 }
 
+inline static void submit(struct pt_regs *ctx, struct send_data_t* data) {
+  data_events.perf_submit(ctx, data, sizeof(struct send_data_t));
+}
+
 inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, struct msghdr *hdr)
 {
   struct send_data_t data = {};
@@ -169,6 +182,8 @@ inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, 
 
   if (socket->type != AF_UNIX)
   {
+    data.status = NOT_AF_UNIX;
+    submit(ctx, &data);
     return;
   }
 
@@ -182,6 +197,8 @@ inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, 
   struct sock *peer = us->peer;
   if (peer->sk_family != AF_UNIX)
   {
+    data.status = NOT_AF_UNIX;
+    submit(ctx, &data);
     return;
   }
 
@@ -190,6 +207,8 @@ inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, 
   {
     if (!copy_sun_path(unix_sk(peer), &data))
     {
+      data.status = NO_PATH;
+      submit(ctx, &data);
       return;
     }
   } else {
@@ -201,7 +220,9 @@ inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, 
 
   if (data.msg_size)
   {
-    data_events.perf_submit(ctx, &data, sizeof(data));
+    submit(ctx, &data);
+  } else {
+    data.status = NO_DATA;
   }
 }
 

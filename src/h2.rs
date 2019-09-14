@@ -55,30 +55,6 @@ impl Display for FrameType {
     }
 }
 
-struct DataFlags {
-    end_stream: bool,
-    padded: bool,
-}
-
-impl DataFlags {
-    fn new(flags: u8) -> Self {
-        DataFlags {
-            end_stream: flags & 0x1 != 0,
-            padded: flags & 0x8 != 0,
-        }
-    }
-}
-
-impl Display for DataFlags {
-    fn fmt(self: &Self, formatter: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        if self.end_stream {
-            return write!(formatter, "[e]");
-        }
-
-        Ok(())
-    }
-}
-
 #[derive(Debug)]
 struct Frame {
     client: bool,
@@ -112,7 +88,7 @@ impl From<&Frame> for DataFrame {
         DataFrame {
             stream_id: f.stream_id,
             end_stream: f.flags & 0x1 != 0,
-            padded: padded,
+            padded,
             payload: f.payload[start..stop].to_vec(),
         }
     }
@@ -146,7 +122,7 @@ impl From<&Frame> for HeadersFrame {
             end_stream: f.flags & 0x1 != 0,
             end_headers: f.flags & 0x4 != 0,
             priority: f.flags & 0x20 != 0, // TODO handle this
-            padded: padded,
+            padded,
             payload: f.payload[start..stop].to_vec(),
         }
     }
@@ -154,7 +130,7 @@ impl From<&Frame> for HeadersFrame {
 
 fn display_prefix(
     f: &Frame,
-    flags: &String,
+    flags: &str,
     formatter: &mut std::fmt::Formatter<'_>,
 ) -> Result<(), std::fmt::Error> {
     let direction = if f.client { ">>" } else { "<<" };
@@ -174,12 +150,11 @@ fn display_data(
         "[end_stream=true]"
     } else {
         ""
-    }
-    .to_string();
+    };
 
     display_prefix(&r, &flags, formatter)?;
 
-    write!(formatter, "\n")?;
+    writeln!(formatter)?;
     write!(
         formatter,
         "{}",
@@ -205,21 +180,21 @@ fn display_headers(
         format!("[{}]", flags.join(","))
     };
     display_prefix(&r, &flag_str, formatter)?;
-    write!(formatter, "\n")?;
-    let mut d = hpack::Decoder::new();
+    writeln!(formatter)?;
+    let mut d = Decoder::new();
     match d.decode(&f.payload) {
         Ok(decoded) => {
             for (key, value) in decoded {
-                write!(
+                writeln!(
                     formatter,
-                    "{}: {}\n",
+                    "{}: {}",
                     String::from_utf8(key).unwrap(),
                     String::from_utf8(value).unwrap()
                 )?;
             }
             Ok(())
         }
-        Err(e) => Err(std::fmt::Error),
+        Err(_) => Err(std::fmt::Error),
     }
 }
 
@@ -256,11 +231,11 @@ impl Frame {
         } else {
             Ok((
                 Frame {
-                    client: client,
+                    client,
                     len: len as usize,
-                    frame_type: frame_type,
-                    flags: flags,
-                    stream_id: stream_id,
+                    frame_type,
+                    flags,
+                    stream_id,
                     payload: d[9..(9 + len as usize)].into(),
                 },
                 9 + len as usize,

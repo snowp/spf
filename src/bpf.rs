@@ -2,6 +2,7 @@ use bcc::core::BPF;
 use bcc::perf::init_perf_map;
 use colored::*;
 use failure::Error;
+use std::collections::HashMap;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -59,17 +60,29 @@ where
         module.attach_kprobe("unix_stream_sendmsg", entry_probe)?;
     }
 
+    let mut failures: HashMap<SendStatus, u64> = HashMap::new();
     started.send(()).unwrap();
     while runnable.load(Ordering::SeqCst) {
         data_perf_map.poll(200);
         // Drain the received updates and invoke the output function with each value.
         while match receiver.try_recv() {
             Ok(data) => {
-                f(&data);
+                match SendStatus::from_u8(data.status) {
+                    Some(SendStatus::Ok) => f(&data),
+                    Some(status) => {
+                        let count = *failures.get(&status).unwrap_or(&0);
+                        failures.insert(status, count + 1);
+                    },
+                    _ => {}
+                }
                 true
             }
             Err(_) => false,
         } {}
+    }
+
+    if !failures.is_empty() {
+        eprintln!("{:?}", failures);
     }
 
     Result::Ok(())
@@ -111,7 +124,30 @@ pub struct send_data_t {
     pub path_size: u8,
     pub time_ns: u64,
     pub bound: u8,
+    pub status: u8,
 }
+
+#[derive(Debug,Hash, Eq, PartialEq)]
+enum SendStatus {
+    Ok,
+    NoPath,
+    NoData,
+    NotAfUnix,
+}
+
+impl SendStatus {
+    fn from_u8(d :u8) -> Option<Self> {
+        match d {
+
+    0x0 => Some(SendStatus::Ok),
+    0x1 => Some(SendStatus::NoPath),
+    0x2 => Some(SendStatus::NoData),
+    0x3 => Some(SendStatus::NotAfUnix),
+    _ =>  None
+        }
+    }
+}
+
 
 fn parse_struct<T>(x: &[u8]) -> T {
     unsafe { ptr::read(x.as_ptr() as *const T) }

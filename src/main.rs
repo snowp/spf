@@ -49,17 +49,14 @@ fn main() {
     .expect("Failed to set handler for SIGINT / SIGTERM");
 
     let (sender, _receiver) = mpsc::channel();
-    match bpf::do_main(
+    if let Err(x) = bpf::do_main(
         matches.value_of("filter").map(str::to_string),
         runnable,
         formatter,
         sender,
     ) {
-        Err(x) => {
             eprintln!("Error: {}", x);
             eprintln!("{}", x.backtrace());
             std::process::exit(1);
-        }
-        _ => {}
     }
 }
