@@ -154,6 +154,18 @@ struct PriorityHeader {
 }
 
 #[derive(Debug)]
+enum PushPromiseFlags {
+    EndHeaders = 0x4,
+    Padded = 0x8,
+}
+
+#[derive(Debug)]
+struct PushPromiseHeaders {
+    padded :bool,
+    end_headers :bool,
+}
+
+#[derive(Debug)]
 enum TypedFrame {
     Data(FrameHeader, DataHeader, Vec<u8>),
     Headers(FrameHeader, HeadersHeader, Vec<(String, String)>),
@@ -161,6 +173,7 @@ enum TypedFrame {
     SettingsFrame(FrameHeader, SettingsHeader, Vec<(StreamSetting, u32)>),
     PriorityFrame(FrameHeader, PriorityHeader),
     WindowUpdate(FrameHeader, u32),
+    PushPromise(FrameHeader, PushPromiseHeaders, u32, Vec<(String, String)>),
 }
 
 // Reads the size of the padding from the provided payload and returns a vec
@@ -242,7 +255,7 @@ impl TypedFrame {
     //  +---------------------------------------------------------------+
     //
     // Stream Dependency and Weight are only present when the HeadersFlag::Priority flag is set.
-    // The code currently assumes that the priority flag will *not* be set. TODO fix this
+    // 
     // If the HeadersFlag::Padded flag is set, the first 8 bits will be the length
     // of the padding.
     fn try_parse_headers(f: &RawFrame) -> Result<Self, ParseError> {
@@ -252,6 +265,13 @@ impl TypedFrame {
         let priority = flagged(HeadersFlag::Priority as u8, f.header.raw_flags); // TODO handle this
         let payload = remove_padding(&f.payload, padded)?;
 
+        let header_block = if priority {
+            payload[5..].into()
+        } else {
+            payload
+        };
+
+        // TODO parse weight + stream dependency
         Ok(TypedFrame::Headers(
             f.header,
             HeadersHeader {
@@ -260,7 +280,7 @@ impl TypedFrame {
                 end_headers,
                 priority,
             },
-            try_parse_header_block(&payload)?,
+            try_parse_header_block(&header_block)?,
         ))
     }
 
@@ -348,6 +368,28 @@ impl TypedFrame {
         ))
     }
 
+    // PUSH_PROMISE payload format:
+    //  +---------------+
+    //  |Pad Length? (8)|
+    //  +-+-------------+-----------------------------------------------+
+    //  |R|                  Promised Stream ID (31)                    |
+    //  +-+-----------------------------+-------------------------------+
+    //  |                   Header Block Fragment (*)                 ...
+    //  +---------------------------------------------------------------+
+    //  |                           Padding (*)                       ...
+    //  +---------------------------------------------------------------+
+    fn try_parse_push_promise(f: &RawFrame) -> Result<Self, ParseError> {
+        let padded = flagged(PushPromiseFlags::Padded as u8, f.header.raw_flags);
+        let end_headers = flagged(PushPromiseFlags::EndHeaders as u8, f.header.raw_flags);
+        let payload = remove_padding(&f.payload, padded)?;
+
+        let mut cursor = Cursor::new(&payload);
+        let promised_stream_id = cursor.read_u32::<NetworkEndian>()?;
+        let headers = try_parse_header_block(&payload[4..])?;
+
+        Ok(TypedFrame::PushPromise(f.header, PushPromiseHeaders{padded, end_headers}, promised_stream_id, headers))
+    }
+
     fn try_parse(f: &RawFrame) -> Result<Self, ParseError> {
         match f.header.frame_type {
             FrameType::Data => Self::try_parse_data(f),
@@ -356,7 +398,10 @@ impl TypedFrame {
             FrameType::Priority => Self::try_parse_priority(f),
             FrameType::WindowUpdate => Self::try_parse_window_update(f),
             FrameType::Continuation => Self::try_parse_continuation(f),
-            _ => panic!(),
+            FrameType::GoAway => panic!(),
+            FrameType::Ping => panic!(),
+            FrameType::PushPromise => Self::try_parse_push_promise(f),
+            FrameType::RstStream => panic!(),
         }
     }
 }
@@ -511,6 +556,16 @@ impl Display for SettingsHeader {
     }
 }
 
+impl Display for PushPromiseHeaders {
+    fn fmt(self: &Self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        if self.end_headers {
+            write!(f, "[end_headers=true]")
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[test]
 fn test_settings_header_display() {
     {
@@ -562,6 +617,15 @@ impl Display for TypedFrame {
             TypedFrame::Continuation(header, continuation_header, headers) => {
                 write!(f, "{}", header)?;
                 write!(f, "{}", continuation_header)?;
+                for (key, value) in headers {
+                    write!(f, "\n{}: {}", key, value)?;
+                }
+                Ok(())
+            },
+            TypedFrame::PushPromise(header, push_promise_header, promised_stream_id, headers) => {
+                write!(f, "{}", header)?;
+                write!(f, "{}", push_promise_header)?;
+                write!(f, " ({})", promised_stream_id)?;
                 for (key, value) in headers {
                     write!(f, "\n{}: {}", key, value)?;
                 }
