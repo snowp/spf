@@ -161,8 +161,8 @@ enum PushPromiseFlags {
 
 #[derive(Debug)]
 struct PushPromiseHeaders {
-    padded :bool,
-    end_headers :bool,
+    padded: bool,
+    end_headers: bool,
 }
 
 #[derive(Debug)]
@@ -255,7 +255,7 @@ impl TypedFrame {
     //  +---------------------------------------------------------------+
     //
     // Stream Dependency and Weight are only present when the HeadersFlag::Priority flag is set.
-    // 
+    //
     // If the HeadersFlag::Padded flag is set, the first 8 bits will be the length
     // of the padding.
     fn try_parse_headers(f: &RawFrame) -> Result<Self, ParseError> {
@@ -387,7 +387,15 @@ impl TypedFrame {
         let promised_stream_id = cursor.read_u32::<NetworkEndian>()?;
         let headers = try_parse_header_block(&payload[4..])?;
 
-        Ok(TypedFrame::PushPromise(f.header, PushPromiseHeaders{padded, end_headers}, promised_stream_id, headers))
+        Ok(TypedFrame::PushPromise(
+            f.header,
+            PushPromiseHeaders {
+                padded,
+                end_headers,
+            },
+            promised_stream_id,
+            headers,
+        ))
     }
 
     fn try_parse(f: &RawFrame) -> Result<Self, ParseError> {
@@ -398,10 +406,10 @@ impl TypedFrame {
             FrameType::Priority => Self::try_parse_priority(f),
             FrameType::WindowUpdate => Self::try_parse_window_update(f),
             FrameType::Continuation => Self::try_parse_continuation(f),
-            FrameType::GoAway => panic!(),
-            FrameType::Ping => panic!(),
+            FrameType::GoAway => Err(ParseError::InvalidFrame("goway".to_string())),
+            FrameType::Ping => Err(ParseError::InvalidFrame("ping".to_string())),
             FrameType::PushPromise => Self::try_parse_push_promise(f),
-            FrameType::RstStream => panic!(),
+            FrameType::RstStream => Err(ParseError::InvalidFrame("rst_stream".to_string())),
         }
     }
 }
@@ -621,7 +629,7 @@ impl Display for TypedFrame {
                     write!(f, "\n{}: {}", key, value)?;
                 }
                 Ok(())
-            },
+            }
             TypedFrame::PushPromise(header, push_promise_header, promised_stream_id, headers) => {
                 write!(f, "{}", header)?;
                 write!(f, "{}", push_promise_header)?;
@@ -787,6 +795,7 @@ fn test_corpus_parsing() {
         .find(|(k, _)| k == "CARGO_MANIFEST_DIR")
         .map(|(_, v)| v)
         .unwrap();
+    let mut failures = Vec::new();
     for entry in std::fs::read_dir(manifest_dir + "/nghttp_corpus").unwrap() {
         let path = entry.unwrap().path();
         let input: Vec<u8> = match std::fs::read(&path) {
@@ -799,9 +808,21 @@ fn test_corpus_parsing() {
             ),
         };
 
-        for f in try_parse_frames(true, &input, input.len()).unwrap() {
-            // println!("{:?}", f);
+        let f = try_parse_frames(true, &input, input.len());
+
+        if let Err(e) = f {
+            failures.push(format!("failed while processing {:?}: {:?}", path, e));
         }
+    }
+
+    {
+        for e in &failures {
+            eprintln!("{}", e);
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!();
     }
 }
 
