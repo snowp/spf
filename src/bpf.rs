@@ -78,14 +78,8 @@ fn fixed_length_string(x: &[u8], size: usize) -> String {
     x[0..size]
         .iter()
         .map(|b| {
-            let c = *b as char;
-            if c.is_ascii() && !c.is_ascii_control() {
-                format!("{}", c)
-            } else if *b < 0x10 {
-                format!("\\0{:x}", b)
-            } else {
-                format!("\\{:x}", b)
-            }
+                let vec: Vec<u8> = std::ascii::escape_default(*b).collect();
+                String::from_utf8(vec).unwrap()
         })
         .collect()
 }
@@ -97,7 +91,7 @@ fn socket_name(x: &[u8], len: Option<usize>) -> String {
     };
     match iter.position(|&r| r == 0) {
         // Handle abstract sockets.
-        Some(0) => "@".to_string() + &socket_name(&x[1..], None),
+        Some(0) => "@".to_string() + &socket_name(&x[1..], len.map(|l| l - 1)),
         Some(zero_pos) => String::from_utf8_lossy(&x[0..zero_pos]).to_string(),
         None => String::from_utf8_lossy(x).to_string(),
     }
@@ -237,12 +231,9 @@ mod tests {
         let mut stream = UnixStream::connect("/tmp/spf2.test").unwrap();
         stream.write(b"hello").unwrap();
 
-        assert_eq!(
-            true,
-            receiver
-                .recv_timeout(time::Duration::from_millis(150))
-                .is_err()
-        );
+        assert!(receiver
+            .recv_timeout(time::Duration::from_millis(150))
+            .is_err());
 
         barc.store(false, Ordering::SeqCst);
     }

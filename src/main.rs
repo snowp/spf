@@ -19,7 +19,7 @@ fn main() {
     })
     .expect("Failed to set handler for SIGINT / SIGTERM");
 
-    let (sender, _) = mpsc::channel();
+    let (sender, _receiver) = mpsc::channel();
     match bpf::do_main(env::args().nth(1), runnable, bpf::stdout_output, sender) {
         Err(x) => {
             eprintln!("Error: {}", x);
