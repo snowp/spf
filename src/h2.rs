@@ -55,6 +55,34 @@ impl Display for FrameType {
     }
 }
 
+trait PaddableFlag {
+    fn padded(flags: u8) -> bool;
+}
+
+#[derive(Debug)]
+enum DataFlag {
+    EndStream = 0x1,
+    Padded = 0x8,
+}
+
+#[derive(Debug)]
+enum HeadersFlag {
+    EndStream = 0x1,
+    EndHeaders = 0x4,
+    Padded = 0x8,
+    Priority = 0x20,
+}
+
+impl PaddableFlag for HeadersFlag {
+    fn padded(flags: u8) -> bool {
+        flagged(HeadersFlag::Padded as u8, flags)
+    }
+}
+
+fn flagged(f: u8, flags: u8) -> bool {
+    f & flags != 0
+}
+
 #[derive(Debug)]
 struct Frame {
     client: bool,
@@ -73,23 +101,27 @@ struct DataFrame {
     payload: Vec<u8>,
 }
 
+fn remove_padding(payload: &Vec<u8>, padded: bool) -> Vec<u8> {
+    let (start, stop) = if padded {
+        let mut c = Cursor::new(&payload);
+        let pad_len = c.read_u32::<NetworkEndian>().unwrap();
+        (4, payload.len() - pad_len as usize)
+    } else {
+        (0, payload.len())
+    };
+
+    payload[start..stop].to_vec()
+}
+
 impl From<&Frame> for DataFrame {
     fn from(f: &Frame) -> Self {
-        let padded = f.flags & 0x8 != 0;
-
-        let (start, stop) = if padded {
-            let mut c = Cursor::new(&f.payload);
-            let pad_len = c.read_u32::<NetworkEndian>().unwrap();
-            (4, f.len - pad_len as usize)
-        } else {
-            (0, f.len)
-        };
+        let padded = flagged(DataFlag::Padded as u8, f.flags);
 
         DataFrame {
             stream_id: f.stream_id,
-            end_stream: f.flags & 0x1 != 0,
+            end_stream: flagged(DataFlag::EndStream as u8, f.flags),
             padded,
-            payload: f.payload[start..stop].to_vec(),
+            payload: remove_padding(&f.payload, padded),
         }
     }
 }
@@ -106,24 +138,15 @@ struct HeadersFrame {
 
 impl From<&Frame> for HeadersFrame {
     fn from(f: &Frame) -> Self {
-        let padded = f.flags & 0x8 != 0;
-
-        // TODO dry up padding handling
-        let (start, stop) = if padded {
-            let mut c = Cursor::new(&f.payload);
-            let pad_len = c.read_u32::<NetworkEndian>().unwrap();
-            (4, f.len - pad_len as usize)
-        } else {
-            (0, f.len)
-        };
+        let padded = flagged(HeadersFlag::Padded as u8, f.flags);
 
         HeadersFrame {
             stream_id: f.stream_id,
-            end_stream: f.flags & 0x1 != 0,
-            end_headers: f.flags & 0x4 != 0,
-            priority: f.flags & 0x20 != 0, // TODO handle this
+            end_stream: flagged(HeadersFlag::EndStream as u8, f.flags),
+            end_headers: flagged(HeadersFlag::EndHeaders as u8, f.flags),
+            priority: flagged(HeadersFlag::Priority as u8, f.flags), // TODO handle this
             padded,
-            payload: f.payload[start..stop].to_vec(),
+            payload: remove_padding(&f.payload, padded),
         }
     }
 }
