@@ -42,7 +42,10 @@ impl FrameType {
             0x7 => Ok(FrameType::GoAway),
             0x8 => Ok(FrameType::WindowUpdate),
             0x9 => Ok(FrameType::Continuation),
-            _ => Err(ParseError::InvalidFrame("invalid frame type".to_string())),
+            _ => Err(ParseError::InvalidFrame(format!(
+                "invalid frame type {}",
+                d
+            ))),
         }
     }
 }
@@ -203,6 +206,8 @@ enum TypedFrame {
     WindowUpdate(FrameHeader, u32),
     PushPromise(FrameHeader, PushPromiseHeaders, u32, ParsedHeaders),
     GoAway(FrameHeader, u32, u32, String), // TODO use struct
+    Ping(FrameHeader, Vec<u8>),
+    RstStream(FrameHeader, u32),
 }
 
 // Reads the size of the padding from the provided payload and returns a vec
@@ -336,9 +341,10 @@ impl TypedFrame {
                 0x5 => StreamSetting::MaxFrameSize,
                 0x6 => StreamSetting::MaxHeaderListSize,
                 _ => {
-                    return Err(ParseError::InvalidFrame(
-                        "invalid settings identifier".to_string(),
-                    ))
+                    return Err(ParseError::InvalidFrame(format!(
+                        "invalid settings identifier {}",
+                        identifier_val
+                    )))
                 }
             };
 
@@ -449,6 +455,30 @@ impl TypedFrame {
         ))
     }
 
+    // PING payload format
+    //  +---------------------------------------------------------------+
+    //  |                                                               |
+    //  |                      Opaque Data (64)                         |
+    //  |                                                               |
+    //  +---------------------------------------------------------------+
+    fn try_parse_ping(f: &RawFrame) -> Result<Self, ParseError> {
+        if f.payload.len() < 8 {
+            return Err(ParseError::TooSmall);
+        }
+        Ok(TypedFrame::Ping(f.header, f.payload[0..8].into()))
+    }
+
+    // RST_STREAM payload format
+    //  +---------------------------------------------------------------+
+    //  |                        Error Code (32)                        |
+    //  +---------------------------------------------------------------+
+    fn try_parse_rst_stream(f: &RawFrame) -> Result<Self, ParseError> {
+        let mut cursor = Cursor::new(&f.payload);
+        let error_code = cursor.read_u32::<NetworkEndian>()?;
+
+        Ok(TypedFrame::RstStream(f.header, error_code))
+    }
+
     fn try_parse(f: &RawFrame) -> Result<Self, ParseError> {
         match f.header.frame_type {
             FrameType::Data => Self::try_parse_data(f),
@@ -458,9 +488,9 @@ impl TypedFrame {
             FrameType::WindowUpdate => Self::try_parse_window_update(f),
             FrameType::Continuation => Self::try_parse_continuation(f),
             FrameType::GoAway => Self::try_parse_goaway(f),
-            FrameType::Ping => Err(ParseError::InvalidFrame("ping".to_string())),
+            FrameType::Ping => Self::try_parse_ping(f),
             FrameType::PushPromise => Self::try_parse_push_promise(f),
-            FrameType::RstStream => Err(ParseError::InvalidFrame("rst_stream".to_string())),
+            FrameType::RstStream => Self::try_parse_rst_stream(f),
         }
     }
 }
@@ -686,6 +716,8 @@ impl Display for TypedFrame {
                     Ok(())
                 }
             }
+            TypedFrame::Ping(header, data) => write!(f, "{} {:?}", header, data),
+            TypedFrame::RstStream(header, error_code) => write!(f, "{} ({})", header, error_code),
         }
     }
 }
