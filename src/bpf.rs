@@ -187,7 +187,6 @@ mod test {
             path_size: 0,
             peer_pid: 0,
             pid: 0,
-            pipe_type: 0,
             status: 0,
             sun_path: [0; 64],
         }
@@ -297,7 +296,6 @@ pub struct send_data_t {
     pub pid: u32,
     pub peer_pid: u32,
     pub msg_size: u64,
-    pub pipe_type: u64,
     pub truncated: u8,
     pub buffer: [u8; 200],
     pub sun_path: [u8; 64],

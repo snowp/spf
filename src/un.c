@@ -4,10 +4,8 @@
 #include <linux/uio.h>
 #include <net/af_unix.h>
 
-#define BUFFER_SIZE 108
+#define SUN_PATH_MAX_LEN 64
 #define READ_BUFFER_SIZE 200
-#define MAX_BUFFER_SIZE 1024
-#define MAX_CHUNKS ((unsigned)16)
 
 // Note that we use a MAX_SEGMENTS that is much lower than IOV_MAX which is typically 1024. This is
 // due to the eBPF limitation which disallows loops, so trying to use a large MAX_SEGMENTS blows up
@@ -103,7 +101,6 @@ enum status_t
   OK,
   NO_PATH,
   NO_DATA,
-  NOT_AF_UNIX
 };
 
 struct send_data_t
@@ -111,10 +108,9 @@ struct send_data_t
   u32 pid;
   u32 peer_pid;
   u64 msg_size;
-  u64 pipe_type;
   u8 truncated;
   char buffer[READ_BUFFER_SIZE];
-  char sun_path[64];
+  char sun_path[SUN_PATH_MAX_LEN];
   u8 path_len;
   u64 time_ns;
   // Whether this is sent to the bound side of the unix socket (i.e. the "server" side).
@@ -153,9 +149,9 @@ inline static size_t copy_sun_path(struct unix_sock *us, struct send_data_t *dat
   {
     FILTER_RET(addr, 0)
     size_t l = addr->len;
-    if (l > 64)
+    if (l > SUN_PATH_MAX_LEN)
     {
-      l = 64;
+      l = SUN_PATH_MAX_LEN;
     }
     bpf_probe_read(data->sun_path, l, addr->name->sun_path);
     data->path_len = l;
@@ -226,7 +222,6 @@ inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, 
     }
 
     data.msg_size = copy_iov(hdr, i, data.buffer, &data.truncated);
-    data.pipe_type = hdr->msg_iter.type;
 
     if (!data.msg_size)
     {
