@@ -2,43 +2,49 @@ use bcc::core::BPF;
 use bcc::perf::init_perf_map;
 use colored::*;
 use failure::Error;
-use std::collections::HashMap;
+use std::cmp;
+use std::convert::TryInto;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub fn stdout_output(data: &send_data_t) {
-    let formatter = |data: &send_data_t| -> String {
-        fixed_length_string(&data.buffer, data.msg_size as usize)
-    };
+    if let Some(s) = SendStatus::from_u8(data.status) {
+        if s != SendStatus::Ok {
+            return;
+        }
 
-    let truncated_str = if data.truncated != 0 {
-        " (truncated)".to_string().red()
-    } else {
-        "".to_string().blue()
-    };
+        let formatter = |data: &send_data_t| -> String {
+            fixed_length_string(&data.buffer, data.msg_size as usize)
+        };
 
-    println!(
-        "{} {} {} {}",
-        format!("[{}\t-> {}]", data.pid, data.peer_pid).yellow(),
-        socket_name(&data.sun_path, Some(data.path_size as usize)).green(),
-        formatter(&data),
-        format!("[{} bytes{}]", data.msg_size, truncated_str).blue(),
-    );
+        let truncated_str = if data.truncated != 0 {
+            " (truncated)".to_string().red()
+        } else {
+            "".to_string().blue()
+        };
+
+        println!(
+            "{} {} {} {}",
+            format!("[{}\t-> {}]", data.pid, data.peer_pid).yellow(),
+            socket_name(&data.sun_path, Some(data.path_size as usize)).green(),
+            formatter(&data),
+            format!("[{} bytes{}]", data.msg_size, truncated_str).blue(),
+        );
+    }
 }
 
-pub fn do_main<F>(
+pub fn do_main(
     path_filter: Option<String>,
     debug: bool,
     runnable: Arc<AtomicBool>,
-    f: F,
+    consumer: Sender<send_data_t>,
     started: Sender<()>,
-) -> Result<(), Error>
-where
-    F: Fn(&send_data_t),
-{
+) -> Result<(), Error> {
     let mut defines = match path_filter {
         Some(path) => format!("#define UN_FILTER \"{}\"\n", path),
         _ => "".to_string(),
@@ -65,28 +71,16 @@ where
         module.attach_kprobe("unix_stream_sendmsg", entry_probe)?;
     }
 
-    let mut failures: HashMap<SendStatus, u64> = HashMap::new();
-    started.send(()).unwrap();
+    let runnable_clone = runnable.clone();
+
+    // Run a dedicated consumer thread that handles sorting the incoming events.
+    thread::spawn(move || {
+        started.send(()).unwrap();
+        sort_events(runnable_clone, receiver, consumer);
+    });
+
     while runnable.load(Ordering::SeqCst) {
         data_perf_map.poll(200);
-        // Drain the received updates and invoke the output function with each value.
-        while match receiver.try_recv() {
-            Ok(data) => {
-                if let Some(status) = SendStatus::from_u8(data.status) {
-                    if status == SendStatus::Ok {
-                        f(&data)
-                    }
-                    let count = *failures.get(&status).unwrap_or(&0);
-                    failures.insert(status, count + 1);
-                }
-                true
-            }
-            Err(_) => false,
-        } {}
-    }
-
-    if !failures.is_empty() {
-        eprintln!("{:?}", failures);
     }
 
     Result::Ok(())
@@ -115,6 +109,188 @@ fn socket_name(x: &[u8], len: Option<usize>) -> String {
     }
 }
 
+// Sorts events as they arrive through the receiver and outputs them to the consumer. The sorting is done using
+// the heuristic that no events will come out of order more than 100ms apart.
+fn sort_events(
+    runnable: Arc<AtomicBool>,
+    receiver: Receiver<send_data_t>,
+    consumer: Sender<send_data_t>,
+) {
+    let mut heap = std::collections::BinaryHeap::new();
+
+    loop {
+        // End the loop if we're shutting down.
+        if !runnable.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // If the heap is empty, block for any update.
+        if heap.is_empty() {
+            match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(data) => heap.push(TimedData {
+                    data,
+                    enqueued: Instant::now(),
+                }),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(_) => return,
+            }
+            continue;
+        }
+
+        // Heap is not empty: look at the first element in the queue and make sure that it's been enqueued for at least 100 milliseconds.
+        // If it hasn't, wait for up to 100 millis for another event.
+        let next = heap.peek().unwrap();
+        let wait_window = {
+            let since = Instant::now().duration_since(next.enqueued);
+            if since.as_millis() < 100 {
+                100 - since.as_millis()
+            } else {
+                0
+            }
+        };
+
+        // If there's no need to wait, output the next element.
+        if wait_window == 0 {
+            let next = heap.pop().unwrap();
+
+            consumer.send(next.data).unwrap();
+        } else {
+            match receiver.recv_timeout(std::time::Duration::from_millis(
+                wait_window.try_into().unwrap(),
+            )) {
+                Ok(data) => heap.push(TimedData {
+                    data,
+                    enqueued: Instant::now(),
+                }),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(e) => panic!(e),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    fn test_send_data_t() -> super::send_data_t {
+        super::send_data_t {
+            truncated: 0,
+            time_ns: 0,
+            bound: 0,
+            buffer: [0; 200],
+            msg_size: 0,
+            path_size: 0,
+            peer_pid: 0,
+            pid: 0,
+            pipe_type: 0,
+            status: 0,
+            sun_path: [0; 64],
+        }
+    }
+
+    #[test]
+    fn test_sort_events() {
+        let runnable = Arc::new(AtomicBool::new(true));
+        let runnable_clone = runnable.clone();
+
+        let (sender, receiver) = mpsc::channel();
+        let (sorted_sender, sorted_receiver) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            super::sort_events(runnable_clone, receiver, sorted_sender);
+        });
+
+        // Send in sorted order.
+        {
+            let mut t = test_send_data_t();
+            t.time_ns = 10;
+            sender.send(t).unwrap();
+        }
+        {
+            let mut t = test_send_data_t();
+            t.time_ns = 15;
+            sender.send(t).unwrap();
+        }
+
+        assert_eq!(sorted_receiver.recv().unwrap().time_ns, 10);
+        assert_eq!(sorted_receiver.recv().unwrap().time_ns, 15);
+
+        // Send in reverse order.
+        {
+            let mut t = test_send_data_t();
+            t.time_ns = 15;
+            sender.send(t).unwrap();
+        }
+        {
+            let mut t = test_send_data_t();
+            t.time_ns = 10;
+            sender.send(t).unwrap();
+        }
+
+        // We'll still receive the updats in sorted order.
+        assert_eq!(sorted_receiver.recv().unwrap().time_ns, 10);
+        assert_eq!(sorted_receiver.recv().unwrap().time_ns, 15);
+
+        // Send in reverse order but delay the second event by 150ms.
+        {
+            let mut t = test_send_data_t();
+            t.time_ns = 15;
+            sender.send(t).unwrap();
+        }
+
+        thread::sleep(Duration::from_millis(150));
+        {
+            let mut t = test_send_data_t();
+            t.time_ns = 10;
+            sender.send(t).unwrap();
+        }
+
+        // No longer sorted since they came in too far apart.
+        assert_eq!(sorted_receiver.recv().unwrap().time_ns, 15);
+        assert_eq!(sorted_receiver.recv().unwrap().time_ns, 10);
+
+        runnable.store(false, Ordering::SeqCst);
+        handle.join().unwrap();
+    }
+}
+
+// Wrapper around data to be used in the min-heap. We store both the data + when it
+// was enqueued into the heap to allow new events to come in at an earlier time due
+// to multiple threads contributing to the list of events.
+struct TimedData {
+    data: send_data_t,
+    enqueued: std::time::Instant,
+}
+
+impl cmp::PartialEq for TimedData {
+    fn eq(&self, other: &Self) -> bool {
+        self.data.time_ns == other.data.time_ns
+    }
+}
+
+impl cmp::Eq for TimedData {}
+
+// Reverse ordering so we get a min-heap.
+impl cmp::PartialOrd for TimedData {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        self.data
+            .time_ns
+            .partial_cmp(&other.data.time_ns)
+            .map(cmp::Ordering::reverse)
+    }
+}
+
+impl cmp::Ord for TimedData {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.data.time_ns.cmp(&other.data.time_ns).reverse()
+    }
+}
+
 #[repr(C)]
 #[derive(Clone)]
 pub struct send_data_t {
@@ -132,7 +308,7 @@ pub struct send_data_t {
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
-enum SendStatus {
+pub enum SendStatus {
     Ok,
     NoPath,
     NoData,
@@ -140,7 +316,7 @@ enum SendStatus {
 }
 
 impl SendStatus {
-    fn from_u8(d: u8) -> Option<Self> {
+    pub fn from_u8(d: u8) -> Option<Self> {
         match d {
             0x0 => Some(SendStatus::Ok),
             0x1 => Some(SendStatus::NoPath),
@@ -286,7 +462,6 @@ mod tests {
     #[test]
     // #[cfg(feature = "with_root")]
     fn test_do_main() {
-        eprintln!("doing test");
         let b = AtomicBool::new(true);
         let barc = Arc::new(b);
 
@@ -315,9 +490,9 @@ mod tests {
         thread::spawn(move || {
             super::do_main(
                 Some("/tmp/spf.test".to_string()),
-                true,
+                false,
                 barc_clone,
-                move |data| sender.send(data.clone()).unwrap(),
+                sender,
                 started_sender,
             )
             .unwrap();
@@ -370,7 +545,7 @@ mod tests {
         let mut updates = HashMap::new();
         for _ in 0..20 {
             let size = receiver
-                .recv_timeout(time::Duration::from_millis(100))
+                .recv_timeout(time::Duration::from_millis(200))
                 .unwrap()
                 .msg_size;
             let current_count = updates.get(&size).unwrap_or(&0).clone();

@@ -2,7 +2,6 @@ use super::bpf;
 use byteorder::NetworkEndian;
 use byteorder::ReadBytesExt;
 use hpack::Decoder;
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::Cursor;
 use std::io::Error;
@@ -884,147 +883,153 @@ impl RawFrame {
     }
 }
 
-#[test]
-fn test_corpus_parsing() {
-    let manifest_dir = std::env::vars()
-        .find(|(k, _)| k == "CARGO_MANIFEST_DIR")
-        .map(|(_, v)| v)
-        .unwrap();
-    let mut failures = Vec::new();
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::collections::HashMap;
 
-    let expected_invalid_frames = {
-        let mut map = HashMap::new();
-        map.insert(
-            "5748e7a24e8d9ecb43de7d1e14519f10d8c669a5a2602fc948bc9a80e6114b63",
-            ParseError::UnknownFrameType(22),
-        );
-        map.insert(
-            "0b39d9df6e1721030667980a41547272ad42377149edcf130b2bf0b76804c61f",
-            ParseError::UnknownFrameType(65),
-        );
-        map.insert(
-            "7232f506e00bee175a3df8d33933fae10c67e501d6cea8e73ce76f4363d0bbea",
-            ParseError::UnknownFrameType(22),
-        );
-        map.insert(
-            "d26a0d653a01c6bf9403e0bc0fa5ea05ea4dd7b163e8d85287b19ff257a88ea7",
-            ParseError::IncompleteFrame,
-        );
-        map
-    };
+    #[test]
+    fn test_corpus_parsing() {
+        let manifest_dir = std::env::vars()
+            .find(|(k, _)| k == "CARGO_MANIFEST_DIR")
+            .map(|(_, v)| v)
+            .unwrap();
+        let mut failures = Vec::new();
 
-    let expected_raw_frames = {
-        let mut map = HashMap::new();
-        map.insert(
-            (
-                "e9d399b6dc6b7d18bac97e5556875ab6df561f1ca718f1fc716a929d3c706f14",
-                2,
-            ),
-            ParseError::FrameSizeError,
-        );
-        map.insert(
-            (
-                "6e3b8913d874a18ec3ab9f74d4fab435b7738e1a14d0754fb79229c4bda9f604",
-                2,
-            ),
-            ParseError::FrameSizeError,
-        );
-        map.insert(
-            (
-                "3376a2cdde0b98759f14490881328f80b5d3c942de3b1304a0382923ce896f8f",
-                3,
-            ),
-            ParseError::ProtocolError("padding exceeds payload".to_string()),
-        );
-        map.insert(
-            (
-                "48ca2b3f63206aa8f774c3cb33958a806a1debf3d9ccf7b09c2d31256498cda6",
-                3,
-            ),
-            ParseError::FrameSizeError,
-        );
-        map.insert(
-            (
-                "7d230ff71bac867a9820e75328f893972df210ab75cdb67f620b370ee5cddf45",
-                2,
-            ),
-            ParseError::FrameSizeError,
-        );
-        map.insert(
-            (
-                "420b9790375f59a6e8c326391023a0981789c2351817996e0c253bfed708ad82",
-                2,
-            ),
-            ParseError::FrameSizeError,
-        );
-        map.insert(
-            (
-                "44f3fc1504a14e693fde420da94f77bf4a44e4e741420291491343f7ae4ecc16",
-                3,
-            ),
-            ParseError::FrameSizeError,
-        );
-        map
-    };
-
-    let mut expected_failures = 0;
-    for entry in std::fs::read_dir(manifest_dir + "/nghttp_corpus").unwrap() {
-        let path = entry.unwrap().path();
-        let filename_str = path.as_path().file_name().unwrap().to_str().unwrap();
-        let input: Vec<u8> = match std::fs::read(&path) {
-            Ok(d) => d,
-            Err(e) => panic!(
-                "failed to read file {:?}: {} (pwd: {:?})",
-                path,
-                e,
-                std::env::current_dir().unwrap()
-            ),
+        let expected_invalid_frames = {
+            let mut map = HashMap::new();
+            map.insert(
+                "5748e7a24e8d9ecb43de7d1e14519f10d8c669a5a2602fc948bc9a80e6114b63",
+                ParseError::UnknownFrameType(22),
+            );
+            map.insert(
+                "0b39d9df6e1721030667980a41547272ad42377149edcf130b2bf0b76804c61f",
+                ParseError::UnknownFrameType(65),
+            );
+            map.insert(
+                "7232f506e00bee175a3df8d33933fae10c67e501d6cea8e73ce76f4363d0bbea",
+                ParseError::UnknownFrameType(22),
+            );
+            map.insert(
+                "d26a0d653a01c6bf9403e0bc0fa5ea05ea4dd7b163e8d85287b19ff257a88ea7",
+                ParseError::IncompleteFrame,
+            );
+            map
         };
 
-        match try_parse_frames(true, &input, input.len()) {
-            Ok(frames) => {
-                for (i, f) in frames.iter().enumerate() {
-                    if let ParseResult::Raw(raw, error) = f {
-                        if let Some(err) = expected_raw_frames.get(&(filename_str, i)) {
-                            if format!("{:?}", err) == format!("{:?}", error) {
-                                expected_failures += 1;
-                                continue;
-                            }
-                        }
-                        failures.push(format!(
-                            "failed to convert {} {:?} {:?} into typed: {:?}",
-                            i, path, raw, error
-                        ));
-                    }
-                }
-            }
-            Err(e) => {
-                if let Some(err) = expected_invalid_frames.get(filename_str) {
-                    if format!("{:?}", err) == format!("{:?}", e) {
-                        expected_failures += 1;
-                        continue;
-                    }
-                }
+        let expected_raw_frames = {
+            let mut map = HashMap::new();
+            map.insert(
+                (
+                    "e9d399b6dc6b7d18bac97e5556875ab6df561f1ca718f1fc716a929d3c706f14",
+                    2,
+                ),
+                ParseError::FrameSizeError,
+            );
+            map.insert(
+                (
+                    "6e3b8913d874a18ec3ab9f74d4fab435b7738e1a14d0754fb79229c4bda9f604",
+                    2,
+                ),
+                ParseError::FrameSizeError,
+            );
+            map.insert(
+                (
+                    "3376a2cdde0b98759f14490881328f80b5d3c942de3b1304a0382923ce896f8f",
+                    3,
+                ),
+                ParseError::ProtocolError("padding exceeds payload".to_string()),
+            );
+            map.insert(
+                (
+                    "48ca2b3f63206aa8f774c3cb33958a806a1debf3d9ccf7b09c2d31256498cda6",
+                    3,
+                ),
+                ParseError::FrameSizeError,
+            );
+            map.insert(
+                (
+                    "7d230ff71bac867a9820e75328f893972df210ab75cdb67f620b370ee5cddf45",
+                    2,
+                ),
+                ParseError::FrameSizeError,
+            );
+            map.insert(
+                (
+                    "420b9790375f59a6e8c326391023a0981789c2351817996e0c253bfed708ad82",
+                    2,
+                ),
+                ParseError::FrameSizeError,
+            );
+            map.insert(
+                (
+                    "44f3fc1504a14e693fde420da94f77bf4a44e4e741420291491343f7ae4ecc16",
+                    3,
+                ),
+                ParseError::FrameSizeError,
+            );
+            map
+        };
 
-                failures.push(format!("failed while processing {:?}: {:?}", path, e))
+        let mut expected_failures = 0;
+        for entry in std::fs::read_dir(manifest_dir + "/nghttp_corpus").unwrap() {
+            let path = entry.unwrap().path();
+            let filename_str = path.as_path().file_name().unwrap().to_str().unwrap();
+            let input: Vec<u8> = match std::fs::read(&path) {
+                Ok(d) => d,
+                Err(e) => panic!(
+                    "failed to read file {:?}: {} (pwd: {:?})",
+                    path,
+                    e,
+                    std::env::current_dir().unwrap()
+                ),
+            };
+
+            match try_parse_frames(true, &input, input.len()) {
+                Ok(frames) => {
+                    for (i, f) in frames.iter().enumerate() {
+                        if let ParseResult::Raw(raw, error) = f {
+                            if let Some(err) = expected_raw_frames.get(&(filename_str, i)) {
+                                if format!("{:?}", err) == format!("{:?}", error) {
+                                    expected_failures += 1;
+                                    continue;
+                                }
+                            }
+                            failures.push(format!(
+                                "failed to convert {} {:?} {:?} into typed: {:?}",
+                                i, path, raw, error
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    if let Some(err) = expected_invalid_frames.get(filename_str) {
+                        if format!("{:?}", err) == format!("{:?}", e) {
+                            expected_failures += 1;
+                            continue;
+                        }
+                    }
+
+                    failures.push(format!("failed while processing {:?}: {:?}", path, e))
+                }
             }
         }
+
+        for e in &failures {
+            eprintln!("{}", e);
+        }
+
+        if !failures.is_empty() {
+            panic!();
+        }
+
+        assert_eq!(
+            expected_failures,
+            expected_invalid_frames.len() + expected_raw_frames.len()
+        );
     }
 
-    for e in &failures {
-        eprintln!("{}", e);
-    }
-
-    if !failures.is_empty() {
-        panic!();
-    }
-
-    assert_eq!(
-        expected_failures,
-        expected_invalid_frames.len() + expected_raw_frames.len()
-    );
 }
-
 enum ParseResult {
     Typed(TypedFrame),
     Raw(RawFrame, ParseError),

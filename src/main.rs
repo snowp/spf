@@ -9,6 +9,7 @@ extern crate hpack;
 
 mod bpf;
 mod h2;
+mod output;
 
 use clap::{App, Arg};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,15 +55,19 @@ fn main() {
     .expect("Failed to set handler for SIGINT / SIGTERM");
 
     let (sender, _receiver) = mpsc::channel();
+
+    let (format_sender, format_handle) = output::new_output_thread(formatter);
     if let Err(x) = bpf::do_main(
         matches.value_of("filter").map(str::to_string),
         matches.value_of("bpf_debug").map(|_| true).unwrap_or(false),
         runnable,
-        formatter,
+        format_sender,
         sender,
     ) {
         eprintln!("Error: {}", x);
         eprintln!("{}", x.backtrace());
         std::process::exit(1);
     }
+
+    format_handle.join().unwrap();
 }
