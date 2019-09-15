@@ -123,7 +123,7 @@ pub struct send_data_t {
     pub msg_size: u64,
     pub pipe_type: u64,
     pub truncated: u8,
-    pub buffer: [u8; 256],
+    pub buffer: [u8; 200],
     pub sun_path: [u8; 64],
     pub path_size: u8,
     pub time_ns: u64,
@@ -157,29 +157,104 @@ fn parse_struct<T>(x: &[u8]) -> T {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::io;
+    use std::io::Read;
     use std::io::{ErrorKind, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
+    use std::sync::mpsc::Receiver;
     use std::sync::Arc;
     use std::thread;
     use std::time;
 
-    fn un_listen_and_accept(path: String, runnable: Arc<AtomicBool>) -> io::Result<()> {
+    fn read_first_ack(s: &mut UnixStream) {
+        let mut buf = [0; 32];
+
+        if let Err(e) = s.read(&mut buf) {
+            panic!(e);
+        }
+    }
+
+    fn read_nth_ack(s: &mut UnixStream, i: usize) {
+        let ack_str = format!("acking {}", i);
+        let mut buf = [0; 32];
+
+        s.set_nonblocking(true).unwrap();
+        loop {
+            if let Ok(d) = s.read(&mut buf) {
+                if d == 0 {
+                    thread::sleep(time::Duration::from_millis(10));
+                }
+                if d == ack_str.len() {
+                    break;
+                } else {
+                    panic!("unexpected payload {}", String::from_utf8_lossy(&buf[0..d]));
+                }
+            }
+        }
+
+        s.set_nonblocking(false).unwrap();
+    }
+
+    // Sets up a handler for a unix socket and listens on the provided path.
+    // To facilitate testing, the handler does the following:
+    //   - Upon accepting a new connection, the handler waits for data to be
+    //     written that contains a string number that is used to inform it how
+    //     many more packets will be written to the stream.
+    //   - The handler acks the count by responding with "ack"
+    //   - The handler acks each subsequent message by writing "acking {}" with
+    //     a number indicating which write is being acked.
+    fn un_listen_and_accept(
+        path: String,
+        runnable: Arc<AtomicBool>,
+    ) -> io::Result<thread::JoinHandle<()>> {
         fs::remove_file(&path).unwrap_or_default();
-        eprintln!("binding");
         let listener = UnixListener::bind(path)?;
-        eprintln!("bound");
         listener.set_nonblocking(true)?;
 
-        eprintln!("spawning");
-        thread::spawn(move || {
+        Ok(thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(mut stream) => {
-                        stream.write(b"hello from server").unwrap();
+                        thread::spawn(move || {
+                            let mut first_read = false;
+                            let mut expected_writes = 0;
+                            let mut buf: [u8; 256] = [0; 256];
+                            loop {
+                                let r = stream.read(&mut buf);
+                                match r {
+                                    Ok(0) => {}
+                                    Ok(d) => {
+                                        // First read tells us how many to expect.
+                                        if !first_read {
+                                            expected_writes = String::from_utf8_lossy(&buf[0..d])
+                                                .parse::<u32>()
+                                                .unwrap();
+                                            first_read = true;
+                                            stream.write(b"ack").unwrap();
+                                        } else {
+                                            // Afterwards we ack each message.
+                                            stream
+                                                .write(
+                                                    format!("acking {}", expected_writes)
+                                                        .as_bytes(),
+                                                )
+                                                .unwrap();
+                                            expected_writes -= 1;
+                                        }
+
+                                        // And close the pipe once we've received all our writes.
+                                        if first_read && expected_writes == 0 {
+                                            return;
+                                        }
+                                    }
+                                    _ => return,
+                                };
+                            }
+                        });
                     }
                     Err(e) => {
                         if e.kind() != ErrorKind::WouldBlock {
@@ -193,9 +268,19 @@ mod tests {
                     return;
                 }
             }
-        });
+        }))
+    }
 
-        Ok(())
+    fn verify_update(receiver: &Receiver<super::send_data_t>, sun_path: &str, payload: &str) {
+        let update = receiver.recv().unwrap();
+        assert_eq!(
+            super::socket_name(&update.sun_path, Some(update.path_size as usize)),
+            sun_path
+        );
+        assert_eq!(
+            super::fixed_length_string(&update.buffer, update.msg_size as usize),
+            payload
+        );
     }
 
     #[test]
@@ -205,23 +290,23 @@ mod tests {
         let b = AtomicBool::new(true);
         let barc = Arc::new(b);
 
-        {
-            println!("starting one");
+        let mut join_handles = Vec::new();
+
+        join_handles.push({
             let barc_clone = barc.clone();
             match un_listen_and_accept("/tmp/spf2.test".to_string(), barc_clone) {
-                Err(e) => eprintln!("failed to listen on spf2 socket {}", e),
-                _ => {}
+                Ok(h) => h,
+                Err(e) => panic!("failed to listen on spf2 socket {}", e),
             }
-            println!("started one");
-        }
+        });
 
-        {
+        join_handles.push({
             let barc_clone = barc.clone();
             match un_listen_and_accept("/tmp/spf.test".to_string(), barc_clone) {
-                Err(e) => eprintln!("failed to listen on spf socket {}", e),
-                _ => {}
+                Ok(h) => h,
+                Err(e) => panic!("failed to listen on spf socket {}", e),
             }
-        }
+        });
 
         let (sender, receiver) = mpsc::channel();
 
@@ -241,43 +326,77 @@ mod tests {
         started_receiver.recv().unwrap();
 
         let mut stream = UnixStream::connect("/tmp/spf.test").unwrap();
+        stream.write(b"1").unwrap();
+        read_first_ack(&mut stream);
+
         stream.write(b"hello").unwrap();
+        read_nth_ack(&mut stream, 1);
 
-        // The first event should be the data written by the client.
-        {
-            let update = receiver.recv().unwrap();
-            assert_eq!(
-                super::socket_name(&update.sun_path, Some(update.path_size as usize)),
-                "/tmp/spf.test"
-            );
-            assert_eq!(
-                super::fixed_length_string(&update.buffer, update.msg_size as usize),
-                "hello"
-            );
-        }
-
-        // Second event should be the server responding.
-        {
-            let update = receiver.recv().unwrap();
-            assert_eq!(
-                super::socket_name(&update.sun_path, Some(update.path_size as usize)),
-                "/tmp/spf.test"
-            );
-            assert_eq!(
-                super::fixed_length_string(&update.buffer, update.msg_size as usize),
-                "hello from server"
-            );
-        }
+        // We should get one update with the window.
+        verify_update(&receiver, "/tmp/spf.test", "1");
+        // Followed by the initial ack.
+        verify_update(&receiver, "/tmp/spf.test", "ack");
+        // Then another string is sent.
+        verify_update(&receiver, "/tmp/spf.test", "hello");
+        // And the server responds.
+        verify_update(&receiver, "/tmp/spf.test", "acking 1");
 
         // Writing to the other socket should not trigger an event
         let mut stream = UnixStream::connect("/tmp/spf2.test").unwrap();
-        stream.write(b"hello").unwrap();
+
+        stream.write(b"0").unwrap();
+        read_first_ack(&mut stream);
 
         assert!(receiver
             .recv_timeout(time::Duration::from_millis(150))
             .is_err());
 
+        // A more complicated test: start a connection and send 10 messages
+        // in a row without reading off the socket, then read all 10 acks.
+        let mut stream = UnixStream::connect("/tmp/spf.test").unwrap();
+        stream.write(b"9").unwrap();
+        read_first_ack(&mut stream);
+
+        // Make 9 to the filtered unix socket and write/read from it.
+        for _ in 0..9 {
+            stream.write(b"xxxx").unwrap();
+        }
+
+        for i in 9..0 {
+            read_nth_ack(&mut stream, i);
+        }
+
+        // We should end up with 100 events of each
+        let mut updates = HashMap::new();
+        for _ in 0..20 {
+            let size = receiver
+                .recv_timeout(time::Duration::from_millis(100))
+                .unwrap()
+                .msg_size;
+            let current_count = updates.get(&size).unwrap_or(&0).clone();
+            updates.insert(size.clone(), current_count + 1);
+        }
+
+        // Instead of bothering with checking all the strings we just verify that the length of each
+        // update makes sense with what we sent.
+
+        assert_eq!(updates.len(), 4);
+
+        // 1 packet with size 3 (ack)
+        assert_eq!(updates.get(&3), Some(&1));
+        // 9 packets with size 4 (xxxx)
+        assert_eq!(updates.get(&4), Some(&9));
+        // 1 packet with size 1 (9)
+        assert_eq!(updates.get(&1), Some(&1));
+        // 9 packets with size 8 (acking X)
+        assert_eq!(updates.get(&8), Some(&9));
+
         barc.store(false, Ordering::SeqCst);
+
+        // Ensure that we're properly closing out the listen threads.
+        for h in join_handles {
+            h.join().unwrap();
+        }
     }
 
 }

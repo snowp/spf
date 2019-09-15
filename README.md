@@ -5,16 +5,13 @@ It allows specifying the name of the unix socket to watch and can output data ei
 raw escaped frames or as decoded HTTP/2 frames.
 
 ## Limitations
-The eBPF tracer will only read the first iovec in the msghdr passed to `unix_stream_sendmsg`,
+The eBPF tracer will only read the first 10 iovec in the msghdr passed to `unix_stream_sendmsg`,
 which means that some data will not be picked up when the kernel passes mulitple buffers to `unix_stream_sendmsg`.
 
 The buffers are passed back to userspace and written to stdout serially: the order of frames are not guaranteed to match
 the actual order in which data was sent. This may result in HTTP/2 frames being displayed out of order.
 
 ## TODOs
-Fix the above limitations:
-* To fix the multiple buffer problem, some work will have to be done to make the eBPF verifier accept code that reads
-  from multiple `iovec`, which seems to be pretty challenging.
 * To fix the ordering issue we'll likely need to sort the events in userspace based on kernel time. This also means that events
   need to be batched for some period instead of outputted immediately. For example, a set of moving windows could be used to allow
   each event to wait for some time for new frames:

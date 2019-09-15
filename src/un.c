@@ -5,9 +5,16 @@
 #include <net/af_unix.h>
 
 #define BUFFER_SIZE 108
-#define READ_BUFFER_SIZE 256
+#define READ_BUFFER_SIZE 200
 #define MAX_BUFFER_SIZE 1024
 #define MAX_CHUNKS ((unsigned)16)
+
+// Note that we use a MAX_SEGMENTS that is much lower than IOV_MAX which is typically 1024. This is
+// due to the eBPF limitation which disallows loops, so trying to use a large MAX_SEGMENTS blows up
+// the program size beyond what is loadable:
+//
+// bpf: Invalid argument. Program un_stream_send_entry too large (10486 insns), at most 4096 insns
+#define MAX_SEGMENTS 10
 
 #ifdef UN_FILTER
 // Returns true if the path of addr matches the prefix given in UN_FILTER.
@@ -117,13 +124,13 @@ struct send_data_t
 
 BPF_PERF_OUTPUT(data_events);
 
-inline static size_t copy_iov(struct msghdr *hdr, char *buffer, u8 volatile *truncated)
+inline static size_t copy_iov(struct msghdr *hdr, size_t index, char *buffer, u8 volatile *truncated)
 {
   struct msghdr stack_hdr;
   bpf_probe_read(&stack_hdr, sizeof(stack_hdr), hdr);
 
   struct iovec vec;
-  bpf_probe_read(&vec, sizeof(vec), stack_hdr.msg_iter.iov);
+  bpf_probe_read(&vec, sizeof(vec), &stack_hdr.msg_iter.iov[index]);
 
   // We assume that 1) there is only one iov chunk and 2) that the union is of type ITER_IOVEC.
   size_t to_copy = vec.iov_len;
@@ -174,67 +181,60 @@ inline static void submit(struct pt_regs *ctx, struct send_data_t *data)
 inline static void copy_stream_data(struct pt_regs *ctx, struct socket *socket, struct msghdr *hdr)
 {
   struct send_data_t data = {};
-  unsigned char truncated = 0;
+  struct sock *sock, *peer;
+  struct unix_sock *us;
+  struct pid *peer_pid;
 
   size_t pid_tgid = bpf_get_current_pid_tgid();
   data.pid = (u32)(pid_tgid >> 32);
   data.time_ns = bpf_ktime_get_ns();
 
-  // Homemade ASSERT: copy_iov assumes that the size of the buffer is READ_BUFFER_SIZE. The for
-  // loop is optimized out so as long as the condition is true the program will be valid.
-  if (sizeof(data.buffer) != sizeof(char) * READ_BUFFER_SIZE)
+#pragma unroll
+  for (size_t i = 0; i < MAX_SEGMENTS; i++)
   {
-    for (;;)
+    if (i == hdr->msg_iter.nr_segs)
     {
-    }
-  }
-
-  if (socket->type != AF_UNIX)
-  {
-    data.status = NOT_AF_UNIX;
-    submit(ctx, &data);
-    return;
-  }
-
-  struct sock *sock = socket->sk;
-  struct unix_sock *us = unix_sk(sock);
-  struct pid *peer_pid = socket->sk->sk_peer_pid;
-  if (peer_pid)
-  {
-    data.peer_pid = peer_pid->numbers[0].nr;
-  }
-
-  struct sock *peer = us->peer;
-  if (peer->sk_family != AF_UNIX)
-  {
-    data.status = NOT_AF_UNIX;
-    submit(ctx, &data);
-    return;
-  }
-
-  if (!copy_sun_path(us, &data))
-  {
-    if (!copy_sun_path(unix_sk(peer), &data))
-    {
-      data.status = NO_PATH;
-      submit(ctx, &data);
       return;
     }
-  }
-  else
-  {
-    // Of the socket and its peer, only the one that is bound will have a name.
-    data.bound = 1;
-  }
 
-  data.msg_size = copy_iov(hdr, data.buffer, &data.truncated);
-  data.pipe_type = hdr->msg_iter.type;
+    unsigned char truncated = 0;
 
-  if (!data.msg_size) {
-    data.status = NO_DATA;
+    sock = socket->sk;
+    us = unix_sk(sock);
+    peer_pid = socket->sk->sk_peer_pid;
+    if (peer_pid)
+    {
+      data.peer_pid = peer_pid->numbers[0].nr;
+    }
+
+    peer = us->peer;
+
+    // TODO we can probably save on # of instructions by being smarter here
+    if (!copy_sun_path(us, &data))
+    {
+      if (!copy_sun_path(unix_sk(peer), &data))
+      {
+        data.status = NO_PATH;
+        submit(ctx, &data);
+        return;
+      }
+    }
+    else
+    {
+      // Of the socket and its peer, only the one that is bound will have a name.
+      data.bound = 1;
+    }
+
+    data.msg_size = copy_iov(hdr, i, data.buffer, &data.truncated);
+    data.pipe_type = hdr->msg_iter.type;
+
+    if (!data.msg_size)
+    {
+      data.status = NO_DATA;
+    }
+
+    submit(ctx, &data);
   }
-
-  submit(ctx, &data);
 }
 
 int un_stream_send_entry(struct pt_regs *ctx, struct socket *socket, struct msghdr *hdr, size_t s)
